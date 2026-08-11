@@ -863,6 +863,7 @@ extern const FFCodec ff_h264_cuvid_decoder;
 extern const FFCodec ff_h264_mf_encoder;
 extern const FFCodec ff_h264_nvenc_encoder;
 extern const FFCodec ff_h264_oh_decoder;
+extern const FFCodec ff_av3a_oh_decoder;
 extern const FFCodec ff_h264_oh_encoder;
 extern const FFCodec ff_h264_omx_encoder;
 extern const FFCodec ff_h264_qsv_encoder;
