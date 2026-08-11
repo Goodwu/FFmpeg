@@ -66,6 +66,7 @@
 #include "riff.h"
 #include "isom.h"
 #include "libavcodec/get_bits.h"
+#include "libavcodec/av3a.h"
 #include "id3v1.h"
 #include "mov_chan.h"
 #include "replaygain.h"
@@ -9325,6 +9326,117 @@ fail:
     return ret;
 }
 
+static int mov_read_dca3(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+{
+    AVStream *st;
+    GetBitContext gb;
+    uint8_t buffer[AV3A_DCA3_BOX_MAX_SIZE + AV_INPUT_BUFFER_PADDING_SIZE] = { 0 };
+    int audio_codec_id, sampling_frequency_index, nn_type, content_type;
+    int channel_number_index = CHANNEL_CONFIG_UNKNOWN;
+    int nb_channels = 0, nb_objects = 0;
+    int bitrate_kbps, resolution_index;
+    int ret;
+
+    if (atom.size < AV3A_DCA3_BOX_MIN_SIZE ||
+        atom.size > AV3A_DCA3_BOX_MAX_SIZE)
+        return AVERROR_INVALIDDATA;
+    if (c->fc->nb_streams < 1)
+        return 0;
+
+    st = c->fc->streams[c->fc->nb_streams - 1];
+    ret = avio_read(pb, buffer, atom.size);
+    if (ret != atom.size)
+        return ret < 0 ? ret : AVERROR_EOF;
+
+    ret = ff_alloc_extradata(st->codecpar, atom.size);
+    if (ret < 0)
+        return ret;
+    memcpy(st->codecpar->extradata, buffer, atom.size);
+
+    ret = init_get_bits8(&gb, buffer, atom.size);
+    if (ret < 0)
+        return ret;
+
+    audio_codec_id = get_bits(&gb, 4);
+    if (audio_codec_id != AV3A_LOSSY_CODEC_ID)
+        return AVERROR_INVALIDDATA;
+
+    sampling_frequency_index = get_bits(&gb, 4);
+    if (sampling_frequency_index >= AV3A_FS_TABLE_SIZE)
+        return AVERROR_INVALIDDATA;
+
+    nn_type = get_bits(&gb, 3);
+    if (nn_type > AV3A_LC_NN_TYPE)
+        return AVERROR_INVALIDDATA;
+    skip_bits(&gb, 1);
+
+    content_type = get_bits(&gb, 4);
+    switch (content_type) {
+    case AV3A_CHANNEL_BASED_TYPE:
+        channel_number_index = get_bits(&gb, 7);
+        skip_bits(&gb, 1);
+        if (channel_number_index > CHANNEL_CONFIG_MC_7_1_4 ||
+            channel_number_index == CHANNEL_CONFIG_MC_10_2 ||
+            channel_number_index == CHANNEL_CONFIG_MC_22_2)
+            return AVERROR_INVALIDDATA;
+        nb_channels =
+            ff_av3a_channels_map_table[channel_number_index].channels;
+        break;
+    case AV3A_OBJECT_BASED_TYPE:
+        nb_objects = get_bits(&gb, 7);
+        skip_bits(&gb, 1);
+        if (nb_objects < 1)
+            return AVERROR_INVALIDDATA;
+        break;
+    case AV3A_CHANNEL_OBJECT_TYPE:
+        channel_number_index = get_bits(&gb, 7);
+        skip_bits(&gb, 1);
+        if (channel_number_index < CHANNEL_CONFIG_STEREO ||
+            channel_number_index > CHANNEL_CONFIG_MC_7_1_4 ||
+            channel_number_index == CHANNEL_CONFIG_MC_10_2 ||
+            channel_number_index == CHANNEL_CONFIG_MC_22_2)
+            return AVERROR_INVALIDDATA;
+        nb_channels =
+            ff_av3a_channels_map_table[channel_number_index].channels;
+        nb_objects = get_bits(&gb, 7);
+        skip_bits(&gb, 1);
+        if (nb_objects < 1)
+            return AVERROR_INVALIDDATA;
+        break;
+    case AV3A_AMBISONIC_TYPE: {
+        int hoa_order = get_bits(&gb, 4);
+        if (hoa_order < AV3A_AMBISONIC_FIRST_ORDER ||
+            hoa_order > AV3A_AMBISONIC_THIRD_ORDER)
+            return AVERROR_INVALIDDATA;
+        nb_channels = (hoa_order + 1) * (hoa_order + 1);
+        break;
+    }
+    default:
+        return AVERROR_INVALIDDATA;
+    }
+
+    bitrate_kbps = get_bits(&gb, 16);
+    resolution_index = get_bits(&gb, 2);
+    if (bitrate_kbps <= 0 ||
+        resolution_index >= AV3A_RESOLUTION_TABLE_SIZE)
+        return AVERROR_INVALIDDATA;
+
+    st->codecpar->codec_id = AV_CODEC_ID_AVS3DA;
+    st->codecpar->frame_size = AV3A_AUDIO_FRAME_SIZE;
+    st->codecpar->sample_rate =
+        ff_av3a_sampling_rate_table[sampling_frequency_index];
+    st->codecpar->bit_rate = bitrate_kbps * 1000LL;
+    st->codecpar->format =
+        ff_av3a_sample_format_map_table[resolution_index].sample_format;
+    st->codecpar->bits_per_raw_sample =
+        ff_av3a_sample_format_map_table[resolution_index].resolution;
+
+    av_channel_layout_uninit(&st->codecpar->ch_layout);
+    av_channel_layout_default(&st->codecpar->ch_layout,
+                              nb_channels + nb_objects);
+    return 0;
+}
+
 static const MOVParseTableEntry mov_default_parse_table[] = {
 { MKTAG('A','C','L','R'), mov_read_aclr },
 { MKTAG('A','P','R','G'), mov_read_avid },
@@ -9339,6 +9451,7 @@ static const MOVParseTableEntry mov_default_parse_table[] = {
 { MKTAG('d','i','n','f'), mov_read_default },
 { MKTAG('D','p','x','E'), mov_read_dpxe },
 { MKTAG('d','r','e','f'), mov_read_dref },
+{ MKTAG('d','c','a','3'), mov_read_dca3 },
 { MKTAG('e','d','t','s'), mov_read_default },
 { MKTAG('e','l','s','t'), mov_read_elst },
 { MKTAG('e','n','d','a'), mov_read_enda },
