@@ -887,6 +887,15 @@ fail:
     return ret;
 }
 
+int64_t ff_mediacodec_pts_to_us(const AVCodecContext *avctx, int64_t pts)
+{
+    int64_t us = pts == AV_NOPTS_VALUE ? 0 : pts;
+
+    if (us && avctx->pkt_timebase.num && avctx->pkt_timebase.den)
+        us = av_rescale_q(us, avctx->pkt_timebase, AV_TIME_BASE_Q);
+    return us;
+}
+
 int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
                            AVPacket *pkt, bool wait)
 {
@@ -935,14 +944,9 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
             return AVERROR_EXTERNAL;
         }
 
-        pts = pkt->pts;
-        if (pts == AV_NOPTS_VALUE) {
+        if (pkt->pts == AV_NOPTS_VALUE)
             av_log(avctx, AV_LOG_WARNING, "Input packet is missing PTS\n");
-            pts = 0;
-        }
-        if (pts && avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
-            pts = av_rescale_q(pts, avctx->pkt_timebase, AV_TIME_BASE_Q);
-        }
+        pts = ff_mediacodec_pts_to_us(avctx, pkt->pts);
 
         if (need_draining) {
             uint32_t flags = ff_AMediaCodec_getBufferFlagEndOfStream(codec);
@@ -982,7 +986,7 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
 }
 
 int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
-                              AVFrame *frame, bool wait)
+                              AVFrame *frame, bool wait, int64_t *out_pts_us)
 {
     int ret;
     uint8_t *data;
@@ -992,6 +996,9 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
     FFAMediaCodecBufferInfo info = { 0 };
     int status;
     int64_t output_dequeue_timeout_us = OUTPUT_DEQUEUE_TIMEOUT_US;
+
+    if (out_pts_us)
+        *out_pts_us = AV_NOPTS_VALUE;
 
     if (s->draining && s->eos) {
         return AVERROR_EOF;
@@ -1020,6 +1027,8 @@ int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
         }
 
         if (info.size) {
+            if (out_pts_us)
+                *out_pts_us = info.presentationTimeUs;
             if (s->surface) {
                 if ((ret = mediacodec_wrap_hw_buffer(avctx, s, index, &info, frame)) < 0) {
                     av_log(avctx, AV_LOG_ERROR, "Failed to wrap MediaCodec buffer\n");

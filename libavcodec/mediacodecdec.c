@@ -36,34 +36,15 @@
 #include "avcodec.h"
 #include "codec_internal.h"
 #include "decode.h"
-#include "dovi_rpu.h"
-#include "h2645_parse.h"
 #include "h264_parse.h"
 #include "h264_ps.h"
 #include "hevc/parse.h"
 #include "hwconfig.h"
 #include "internal.h"
 #include "jni.h"
+#include "mediacodec_dovi.h"
 #include "mediacodec_wrapper.h"
 #include "mediacodecdec_common.h"
-
-typedef struct P5RpuEntry {
-    unsigned seq;
-    int valid;
-    int duplicate_pts;
-    int64_t pts_us;
-    uint32_t rpu_hash;
-    unsigned rpu_size;
-    unsigned rpu_count;
-    int missing_pts;
-    int parse_error;
-    int consumed;
-    unsigned epoch;
-    AVDOVIMetadata *metadata;
-    int metadata_size;
-    uint8_t *raw_rpu;
-    int raw_rpu_size;
-} P5RpuEntry;
 
 typedef struct MediaCodecH264DecContext {
 
@@ -78,392 +59,15 @@ typedef struct MediaCodecH264DecContext {
 
     int use_ndk_codec;
 
-    /* Match P5 access-unit RPU metadata to MediaCodec output by timestamp. */
-    struct {
-        int enabled;
-        int attach;
-        DOVIContext dovi;
-        unsigned epoch;
-        unsigned inputs;
-        unsigned outputs;
-        unsigned matched;
-        unsigned errors;
-        unsigned discarded;
-        int pending;
-        P5RpuEntry entries[320], next;
-    } p5_rpu;
+    int dovi;
+    FFMediacodecDovi *dovi_export;
 } MediaCodecH264DecContext;
-
-static void p5_rpu_clear_entry(P5RpuEntry *entry)
-{
-    av_freep(&entry->metadata);
-    av_freep(&entry->raw_rpu);
-    entry->metadata_size = 0;
-    entry->raw_rpu_size = 0;
-}
-
-static int p5_rpu_start_code(const uint8_t *data, int size, int pos,
-                               int *header)
-{
-    for (int i = pos; i + 3 <= size; i++) {
-        if (data[i] || data[i + 1] ||
-            (data[i + 2] != 1 &&
-             !(i + 3 < size && !data[i + 2] && data[i + 3] == 1)))
-            continue;
-        *header = i + (data[i + 2] == 1 ? 3 : 4);
-        return i;
-    }
-    return -1;
-}
-
-static void p5_rpu_nal(MediaCodecH264DecContext *s,
-                         const uint8_t *data, int size)
-{
-    uint32_t hash;
-
-    if (size < 2) {
-        s->p5_rpu.next.parse_error = 1;
-        return;
-    }
-    if (((data[0] >> 1) & 0x3f) != 62)
-        return;
-
-    s->p5_rpu.next.rpu_count++;
-    /* A Dolby Vision RPU has layer id 0 and temporal_id_plus1 1. */
-    if (((data[0] & 1) << 5 | data[1] >> 3) != 0 || (data[1] & 7) != 1)
-        s->p5_rpu.next.parse_error = 1;
-    s->p5_rpu.next.rpu_size += size - 2;
-    hash = s->p5_rpu.next.rpu_hash ? s->p5_rpu.next.rpu_hash : 2166136261U;
-    for (int i = 2; i < size; i++)
-        hash = (hash ^ data[i]) * 16777619U;
-    s->p5_rpu.next.rpu_hash = hash;
-}
-
-static void p5_rpu_parse_metadata(AVCodecContext *avctx, AVPacket *pkt,
-                                    int length_size)
-{
-    MediaCodecH264DecContext *s = avctx->priv_data;
-    H2645Packet split = { 0 };
-    size_t sd_size = 0;
-    const uint8_t *sd;
-    int flags = H2645_FLAG_SMALL_PADDING;
-    int ret;
-
-    if (s->p5_rpu.next.rpu_count != 1 || s->p5_rpu.next.parse_error)
-        return;
-    sd = av_packet_get_side_data(pkt, AV_PKT_DATA_DOVI_CONF, &sd_size);
-    if (sd && sd_size >= sizeof(s->p5_rpu.dovi.cfg))
-        memcpy(&s->p5_rpu.dovi.cfg, sd, sizeof(s->p5_rpu.dovi.cfg));
-    if (length_size)
-        flags |= H2645_FLAG_IS_NALFF;
-    ret = ff_h2645_packet_split(&split, pkt->data, pkt->size, avctx,
-                                length_size, AV_CODEC_ID_HEVC, flags);
-    if (ret < 0) {
-        s->p5_rpu.next.parse_error = 1;
-        goto done;
-    }
-    for (int i = 0; i < split.nb_nals; i++) {
-        H2645NAL *nal = &split.nals[i];
-        if (nal->type != 62)
-            continue;
-        if (nal->size <= 2 || nal->raw_size <= 2 ||
-            nal->nuh_layer_id || nal->temporal_id) {
-            s->p5_rpu.next.parse_error = 1;
-            break;
-        }
-        ret = ff_dovi_rpu_parse(&s->p5_rpu.dovi, nal->data + 2,
-                                nal->size - 2, avctx->err_recognition);
-        if (ret < 0) {
-            s->p5_rpu.next.parse_error = 1;
-            break;
-        }
-        s->p5_rpu.next.metadata_size = ff_dovi_get_metadata(
-            &s->p5_rpu.dovi, &s->p5_rpu.next.metadata);
-        if (s->p5_rpu.next.metadata_size <= 0) {
-            s->p5_rpu.next.parse_error = 1;
-            break;
-        }
-        s->p5_rpu.next.raw_rpu_size = nal->raw_size - 2;
-        s->p5_rpu.next.raw_rpu = av_memdup(nal->raw_data + 2,
-                                              s->p5_rpu.next.raw_rpu_size);
-        if (!s->p5_rpu.next.raw_rpu)
-            s->p5_rpu.next.parse_error = 1;
-        break;
-    }
-    if (!s->p5_rpu.next.metadata)
-        s->p5_rpu.next.parse_error = 1;
-done:
-    if (s->p5_rpu.next.parse_error)
-        p5_rpu_clear_entry(&s->p5_rpu.next);
-    ff_h2645_packet_uninit(&split);
-}
-
-static void p5_rpu_packet(AVCodecContext *avctx, AVPacket *pkt)
-{
-    MediaCodecH264DecContext *s = avctx->priv_data;
-    int header, start, pos, length_size = 0;
-
-    if (!s->p5_rpu.enabled)
-        return;
-    p5_rpu_clear_entry(&s->p5_rpu.next);
-    memset(&s->p5_rpu.next, 0, sizeof(s->p5_rpu.next));
-    s->p5_rpu.pending = 1;
-    s->p5_rpu.next.epoch = s->p5_rpu.epoch;
-    s->p5_rpu.next.missing_pts = pkt->pts == AV_NOPTS_VALUE;
-    s->p5_rpu.next.pts_us = pkt->pts;
-    if (!s->p5_rpu.next.missing_pts && pkt->pts &&
-        avctx->pkt_timebase.num && avctx->pkt_timebase.den)
-        s->p5_rpu.next.pts_us = av_rescale_q(pkt->pts, avctx->pkt_timebase,
-                                                AV_TIME_BASE_Q);
-    if (!pkt->data || pkt->size <= 0) {
-        s->p5_rpu.next.parse_error = 1;
-        return;
-    }
-
-    start = p5_rpu_start_code(pkt->data, pkt->size, 0, &header);
-    if (start >= 0 && start <= 3) {
-        while (start >= 0) {
-            int next_header, next = p5_rpu_start_code(pkt->data, pkt->size,
-                                                         header, &next_header);
-            p5_rpu_nal(s, pkt->data + header,
-                         (next < 0 ? pkt->size : next) - header);
-            start = next;
-            if (next >= 0)
-                header = next_header;
-        }
-    } else {
-        /* hvcC stores lengthSizeMinusOne in the low two bits of byte 21. */
-        if (avctx->extradata_size > 21 && avctx->extradata[0] == 1)
-            length_size = (avctx->extradata[21] & 3) + 1;
-        if (!length_size) {
-            s->p5_rpu.next.parse_error = 1;
-            return;
-        }
-        for (pos = 0; pos < pkt->size;) {
-            unsigned len = 0;
-            if (pkt->size - pos < length_size) {
-                s->p5_rpu.next.parse_error = 1;
-                break;
-            }
-            for (int i = 0; i < length_size; i++)
-                len = (len << 8) | pkt->data[pos++];
-            if (!len || len > pkt->size - pos) {
-                s->p5_rpu.next.parse_error = 1;
-                break;
-            }
-            p5_rpu_nal(s, pkt->data + pos, len);
-            pos += len;
-        }
-    }
-    p5_rpu_parse_metadata(avctx, pkt, length_size);
-}
-
-static void p5_rpu_commit(AVCodecContext *avctx)
-{
-    MediaCodecH264DecContext *s = avctx->priv_data;
-    P5RpuEntry *entry;
-    unsigned seq, slot;
-    const char *status = "OK";
-
-    if (!s->p5_rpu.enabled || !s->p5_rpu.pending)
-        return;
-    s->p5_rpu.pending = 0;
-    seq = s->p5_rpu.inputs++;
-    slot = seq % FF_ARRAY_ELEMS(s->p5_rpu.entries);
-    entry = &s->p5_rpu.entries[slot];
-    if (entry->valid && !entry->consumed) {
-        s->p5_rpu.discarded++;
-        s->p5_rpu.errors++;
-        if (s->p5_rpu.discarded <= 20 ||
-            s->p5_rpu.discarded % 1000 == 0)
-            av_log(avctx, AV_LOG_ERROR,
-                   "MEDIA_KIT_P5_RPU stale eviction epoch=%u input_seq=%u held_seq=%u discarded=%u\n",
-                   s->p5_rpu.epoch, seq, entry->seq,
-                   s->p5_rpu.discarded);
-    }
-    for (unsigned j = 0; j < FF_ARRAY_ELEMS(s->p5_rpu.entries); j++) {
-        P5RpuEntry *old = &s->p5_rpu.entries[j];
-        if (old->valid && old->epoch == s->p5_rpu.epoch &&
-            !old->missing_pts && !s->p5_rpu.next.missing_pts &&
-            old->pts_us == s->p5_rpu.next.pts_us)
-            s->p5_rpu.next.duplicate_pts = 1;
-    }
-    p5_rpu_clear_entry(entry);
-    *entry = s->p5_rpu.next;
-    entry->seq = seq;
-    entry->valid = 1;
-    s->p5_rpu.next.metadata = NULL;
-    s->p5_rpu.next.raw_rpu = NULL;
-    if (entry->missing_pts)
-        status = "MISSING_INPUT_PTS";
-    else if (entry->parse_error)
-        status = "PARSE_ERROR";
-    else if (entry->rpu_count != 1)
-        status = entry->rpu_count ? "MULTIPLE_RPU" : "MISSING_RPU";
-    else if (entry->duplicate_pts)
-        status = "DUPLICATE_INPUT_PTS";
-    if (strcmp(status, "OK"))
-        s->p5_rpu.errors++;
-    if (strcmp(status, "OK") && s->p5_rpu.errors <= 20)
-        av_log(avctx, AV_LOG_WARNING,
-               "MEDIA_KIT_P5_RPU input epoch=%u seq=%u pts_us=%"PRId64
-               " rpu=%u bytes=%u hash=%08x meta_bytes=%d profile=%u residual=%d status=%s\n",
-               s->p5_rpu.epoch, seq, entry->pts_us,
-               entry->rpu_count, entry->rpu_size, entry->rpu_hash,
-               entry->metadata_size, s->p5_rpu.dovi.cfg.dv_profile,
-               entry->metadata ?
-                   av_dovi_get_header(entry->metadata)->disable_residual_flag : -1,
-               status);
-}
-
-static void p5_rpu_output(AVCodecContext *avctx, AVFrame *frame)
-{
-    MediaCodecH264DecContext *s = avctx->priv_data;
-    P5RpuEntry *entry = NULL;
-    int64_t pts_us;
-    int found = -1, count = 0, attached = 0, metadata_size = 0;
-    const char *status;
-
-    if (!s->p5_rpu.enabled)
-        return;
-    if (frame->format == AV_PIX_FMT_MEDIACODEC && frame->data[3])
-        pts_us = ((MediaCodecBuffer *)frame->data[3])->pts;
-    else if (frame->pts != AV_NOPTS_VALUE && avctx->pkt_timebase.num &&
-             avctx->pkt_timebase.den)
-        pts_us = av_rescale_q(frame->pts, avctx->pkt_timebase, AV_TIME_BASE_Q);
-    else
-        pts_us = AV_NOPTS_VALUE;
-
-    s->p5_rpu.outputs++;
-    for (unsigned i = 0; i < FF_ARRAY_ELEMS(s->p5_rpu.entries); i++) {
-        if (s->p5_rpu.entries[i].valid &&
-            s->p5_rpu.entries[i].epoch == s->p5_rpu.epoch &&
-            !s->p5_rpu.entries[i].missing_pts && pts_us != AV_NOPTS_VALUE &&
-            s->p5_rpu.entries[i].pts_us == pts_us) {
-            found = i;
-            count++;
-        }
-    }
-    if (pts_us == AV_NOPTS_VALUE)
-        status = "MISSING_OUTPUT_PTS";
-    else if (count > 1)
-        status = "DUPLICATE_INPUT_PTS";
-    else if (count == 0)
-        status = "UNMATCHED_OUTPUT_PTS";
-    else if (s->p5_rpu.entries[found].consumed)
-        status = "DUPLICATE_OUTPUT_PTS";
-    else if (s->p5_rpu.entries[found].duplicate_pts)
-        status = "DUPLICATE_INPUT_PTS";
-    else if (s->p5_rpu.entries[found].parse_error)
-        status = "PARSE_ERROR";
-    else if (s->p5_rpu.entries[found].rpu_count != 1)
-        status = s->p5_rpu.entries[found].rpu_count ? "MULTIPLE_RPU" : "MISSING_RPU";
-    else
-        status = "MATCH";
-
-    if (count > 1) {
-        for (unsigned i = 0; i < FF_ARRAY_ELEMS(s->p5_rpu.entries); i++) {
-            P5RpuEntry *ambiguous = &s->p5_rpu.entries[i];
-            if (ambiguous->valid && ambiguous->epoch == s->p5_rpu.epoch &&
-                !ambiguous->missing_pts && ambiguous->pts_us == pts_us) {
-                ambiguous->consumed = 1;
-                p5_rpu_clear_entry(ambiguous);
-            }
-        }
-    }
-    if (count == 1 && !s->p5_rpu.entries[found].consumed) {
-        AVFrameSideData *meta_sd, *raw_sd;
-        entry = &s->p5_rpu.entries[found];
-        metadata_size = entry->metadata_size;
-        if (s->p5_rpu.attach && !strcmp(status, "MATCH")) {
-            if (!entry->metadata || !entry->raw_rpu) {
-                status = "MISSING_PARSED_METADATA";
-            } else if (av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_METADATA) ||
-                       av_frame_get_side_data(frame, AV_FRAME_DATA_DOVI_RPU_BUFFER)) {
-                status = "EXISTING_DOVI_SIDE_DATA";
-            } else {
-                meta_sd = av_frame_new_side_data(frame, AV_FRAME_DATA_DOVI_METADATA,
-                                                 entry->metadata_size);
-                raw_sd = meta_sd ? av_frame_new_side_data(frame, AV_FRAME_DATA_DOVI_RPU_BUFFER,
-                                                          entry->raw_rpu_size) : NULL;
-                if (!meta_sd || !raw_sd) {
-                    if (meta_sd)
-                        av_frame_remove_side_data(frame, AV_FRAME_DATA_DOVI_METADATA);
-                    status = "ATTACH_ERROR";
-                } else {
-                    memcpy(meta_sd->data, entry->metadata, entry->metadata_size);
-                    memcpy(raw_sd->data, entry->raw_rpu, entry->raw_rpu_size);
-                    attached = 1;
-                }
-            }
-        }
-        entry->consumed = 1;
-        p5_rpu_clear_entry(entry);
-    }
-    if (!strcmp(status, "MATCH"))
-        s->p5_rpu.matched++;
-    if (strcmp(status, "MATCH"))
-        s->p5_rpu.errors++;
-    if (strcmp(status, "MATCH") && s->p5_rpu.errors <= 20)
-        av_log(avctx, AV_LOG_WARNING,
-               "MEDIA_KIT_P5_RPU output epoch=%u seq=%u pts_us=%"PRId64
-               " input_seq=%d meta_bytes=%d attached=%d status=%s\n", s->p5_rpu.epoch,
-               s->p5_rpu.outputs - 1, pts_us,
-               count == 1 ? (int)s->p5_rpu.entries[found].seq : -1,
-               metadata_size, attached, status);
-}
-
-static int p5_rpu_receive(AVCodecContext *avctx, AVFrame *frame, bool wait)
-{
-    MediaCodecH264DecContext *s = avctx->priv_data;
-    int ret = ff_mediacodec_dec_receive(avctx, s->ctx, frame, wait);
-    if (!ret)
-        p5_rpu_output(avctx, frame);
-    return ret;
-}
-
-static void p5_rpu_flush(AVCodecContext *avctx)
-{
-    MediaCodecH264DecContext *s = avctx->priv_data;
-    if (!s->p5_rpu.enabled)
-        return;
-    for (unsigned i = 0; i < FF_ARRAY_ELEMS(s->p5_rpu.entries); i++) {
-        if (s->p5_rpu.entries[i].valid &&
-            s->p5_rpu.entries[i].epoch == s->p5_rpu.epoch &&
-            !s->p5_rpu.entries[i].consumed)
-            s->p5_rpu.discarded++;
-        p5_rpu_clear_entry(&s->p5_rpu.entries[i]);
-        s->p5_rpu.entries[i].valid = 0;
-    }
-    av_log(avctx, AV_LOG_WARNING,
-           "MEDIA_KIT_P5_RPU flush epoch=%u next_epoch=%u discarded=%u\n",
-           s->p5_rpu.epoch, s->p5_rpu.epoch + 1, s->p5_rpu.discarded);
-    p5_rpu_clear_entry(&s->p5_rpu.next);
-    s->p5_rpu.pending = 0;
-    ff_dovi_ctx_flush(&s->p5_rpu.dovi);
-    s->p5_rpu.epoch++;
-}
 
 static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
 {
     MediaCodecH264DecContext *s = avctx->priv_data;
-    unsigned unconsumed = 0;
 
-    if (s->p5_rpu.enabled) {
-        for (unsigned i = 0; i < FF_ARRAY_ELEMS(s->p5_rpu.entries); i++)
-            if (s->p5_rpu.entries[i].valid &&
-                !s->p5_rpu.entries[i].consumed)
-                unconsumed++;
-        av_log(avctx, AV_LOG_WARNING,
-               "MEDIA_KIT_P5_RPU summary inputs=%u outputs=%u matched=%u errors=%u discarded=%u unconsumed=%u epoch=%u\n",
-               s->p5_rpu.inputs, s->p5_rpu.outputs, s->p5_rpu.matched,
-               s->p5_rpu.errors, s->p5_rpu.discarded, unconsumed,
-               s->p5_rpu.epoch);
-        for (unsigned i = 0; i < FF_ARRAY_ELEMS(s->p5_rpu.entries); i++)
-            p5_rpu_clear_entry(&s->p5_rpu.entries[i]);
-        p5_rpu_clear_entry(&s->p5_rpu.next);
-        ff_dovi_ctx_unref(&s->p5_rpu.dovi);
-    }
+    ff_mediacodec_dovi_free(avctx, &s->dovi_export);
 
     ff_mediacodec_dec_close(avctx, s->ctx);
     s->ctx = NULL;
@@ -720,21 +324,9 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
     FFAMediaFormat *format = NULL;
     MediaCodecH264DecContext *s = avctx->priv_data;
 
-#if defined(__ANDROID__)
-    if (avctx->codec_id == AV_CODEC_ID_HEVC) {
-        const AVPacketSideData *sd =
-            ff_get_coded_side_data(avctx, AV_PKT_DATA_DOVI_CONF);
-        if (sd && sd->size >= sizeof(s->p5_rpu.dovi.cfg)) {
-            memcpy(&s->p5_rpu.dovi.cfg, sd->data,
-                   sizeof(s->p5_rpu.dovi.cfg));
-            if (s->p5_rpu.dovi.cfg.dv_profile == 5)
-                s->p5_rpu.enabled = s->p5_rpu.attach = 1;
-        }
-        if (s->p5_rpu.enabled) {
-            s->p5_rpu.dovi.logctx = avctx;
-        }
-    }
-#endif
+    ret = ff_mediacodec_dovi_alloc(avctx, &s->dovi_export, s->dovi);
+    if (ret < 0)
+        goto done;
 
     if (s->use_ndk_codec < 0)
         s->use_ndk_codec = !av_jni_get_java_vm(avctx);
@@ -905,6 +497,20 @@ done:
     return ret;
 }
 
+/* Receive one frame from MediaCodec and attach the RPU side data tracked for
+ * its presentationTimeUs. */
+static int mediacodec_receive_frame_internal(AVCodecContext *avctx,
+                                             AVFrame *frame, bool wait)
+{
+    MediaCodecH264DecContext *s = avctx->priv_data;
+    int64_t pts_us = AV_NOPTS_VALUE;
+    int ret = ff_mediacodec_dec_receive(avctx, s->ctx, frame, wait, &pts_us);
+
+    if (!ret)
+        ff_mediacodec_dovi_attach_output(avctx, s->dovi_export, frame, pts_us);
+    return ret;
+}
+
 static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 {
     MediaCodecH264DecContext *s = avctx->priv_data;
@@ -919,11 +525,11 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
             return AVERROR(EAGAIN);
         }
         if (flush_ret == 1)
-            p5_rpu_flush(avctx);
+            ff_mediacodec_dovi_flush(avctx, s->dovi_export);
     }
 
     /* poll for new frame */
-    ret = p5_rpu_receive(avctx, frame, false);
+    ret = mediacodec_receive_frame_internal(avctx, frame, false);
     if (ret != AVERROR(EAGAIN))
         return ret;
 
@@ -934,7 +540,7 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
             index = ff_AMediaCodec_dequeueInputBuffer(s->ctx->codec, 0);
             if (index < 0) {
                 /* no space, block for an output frame to appear */
-                ret = p5_rpu_receive(avctx, frame, true);
+                ret = mediacodec_receive_frame_internal(avctx, frame, true);
                 /* Try again if both input port and output port return EAGAIN.
                  * If no data is consumed and no frame in output, it can make
                  * both avcodec_send_packet() and avcodec_receive_frame()
@@ -980,15 +586,17 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
             ret = ff_mediacodec_dec_send(avctx, s->ctx, &null_pkt, true);
             if (ret < 0)
                 return ret;
-            return p5_rpu_receive(avctx, frame, true);
+            return mediacodec_receive_frame_internal(avctx, frame, true);
         } else if (ret == AVERROR(EAGAIN) && s->ctx->current_input_buffer < 0) {
-            return p5_rpu_receive(avctx, frame, true);
+            return mediacodec_receive_frame_internal(avctx, frame, true);
         } else if (ret < 0) {
             return ret;
         }
-        p5_rpu_packet(avctx, &s->buffered_pkt);
-        /* Register before queueing: a split AU can produce output early. */
-        p5_rpu_commit(avctx);
+        /* Register the RPU before queueing: a split AU can produce output
+         * early. */
+        ff_mediacodec_dovi_track_input(avctx, s->dovi_export, &s->buffered_pkt,
+                                       ff_mediacodec_pts_to_us(avctx,
+                                                               s->buffered_pkt.pts));
     }
 
     return AVERROR(EAGAIN);
@@ -1001,7 +609,7 @@ static void mediacodec_decode_flush(AVCodecContext *avctx)
     av_packet_unref(&s->buffered_pkt);
 
     if (ff_mediacodec_dec_flush(avctx, s->ctx) == 1)
-        p5_rpu_flush(avctx);
+        ff_mediacodec_dovi_flush(avctx, s->dovi_export);
 }
 
 static const AVCodecHWConfigInternal *const mediacodec_hw_configs[] = {
@@ -1024,6 +632,15 @@ static const AVOption ff_mediacodec_vdec_options[] = {
                      OFFSET(delay_flush), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
     { "ndk_codec", "Use MediaCodec from NDK",
                    OFFSET(use_ndk_codec), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, VD },
+    { "dovi", "Export Dolby Vision RPU frame side data (HEVC only)",
+              OFFSET(dovi), AV_OPT_TYPE_INT,
+              { .i64 = FF_MEDIACODEC_DOVI_AUTO }, 0, FF_MEDIACODEC_DOVI_OFF, VD, .unit = "dovi" },
+    { "auto", "Enable for profile 5 streams",
+              0, AV_OPT_TYPE_CONST, { .i64 = FF_MEDIACODEC_DOVI_AUTO }, 0, 0, VD, .unit = "dovi" },
+    { "on",   "Always enable",
+              0, AV_OPT_TYPE_CONST, { .i64 = FF_MEDIACODEC_DOVI_ON },   0, 0, VD, .unit = "dovi" },
+    { "off",  "Disable",
+              0, AV_OPT_TYPE_CONST, { .i64 = FF_MEDIACODEC_DOVI_OFF },  0, 0, VD, .unit = "dovi" },
     { NULL }
 };
 

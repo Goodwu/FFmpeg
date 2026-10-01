@@ -83,10 +83,18 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx,
                            AVPacket *pkt,
                            bool wait);
 
+/**
+ * Convert a packet/frame pts in avctx->pkt_timebase to the microseconds
+ * handed to MediaCodec as presentationTimeUs, mirroring
+ * ff_mediacodec_dec_send().
+ */
+int64_t ff_mediacodec_pts_to_us(const AVCodecContext *avctx, int64_t pts);
+
 int ff_mediacodec_dec_receive(AVCodecContext *avctx,
                               MediaCodecDecContext *s,
                               AVFrame *frame,
-                              bool wait);
+                              bool wait,
+                              int64_t *out_pts_us);
 
 int ff_mediacodec_dec_flush(AVCodecContext *avctx,
                             MediaCodecDecContext *s);
