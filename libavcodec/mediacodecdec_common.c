@@ -21,12 +21,14 @@
  */
 
 #include <string.h>
+#include <stdarg.h>
 #include <sys/types.h>
 
 #include "libavutil/avassert.h"
 #include "libavutil/common.h"
 #include "libavutil/hwcontext_mediacodec.h"
 #include "libavutil/mem.h"
+#include "libavutil/sha.h"
 #include "libavutil/log.h"
 #include "libavutil/pixfmt.h"
 #include "libavutil/time.h"
@@ -82,6 +84,281 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301 USA
  *
  */
+
+/* Only the explicit native-DV diagnostic option calls begin with enabled=1.
+ * IDs are process-local monotonic counters, never addresses. */
+static atomic_uint_fast64_t native_dv_diag_next_id = ATOMIC_VAR_INIT(0);
+
+/* Reserve event 4096 for a single truncation marker; close/init-failure are
+ * separately bounded terminal events. Check before hashing or scanning. */
+static void native_dv_diag_limit(AVCodecContext *avctx, MediaCodecNativeDvDiag *d)
+{
+    if (!d->event_limit_logged) {
+        av_log(avctx, AV_LOG_INFO,
+               "native_dv_diag decoder=%"PRIu64" event=instance_limit max_events=4096\n",
+               d->decoder_id);
+        d->event_limit_logged = 1;
+        d->event_count++;
+    }
+    d->enabled = d->capture_au = 0;
+}
+
+static int native_dv_diag_allow(AVCodecContext *avctx, MediaCodecNativeDvDiag *d)
+{
+    if (!d->enabled)
+        return 0;
+    if (d->event_count >= 4095) {
+        native_dv_diag_limit(avctx, d);
+        return 0;
+    }
+    return 1;
+}
+
+void ff_mediacodec_diag_log(AVCodecContext *avctx, MediaCodecNativeDvDiag *d,
+                           const char *format, ...)
+{
+    va_list ap;
+    if (!native_dv_diag_allow(avctx, d))
+        return;
+    d->event_count++;
+    va_start(ap, format);
+    av_vlog(avctx, AV_LOG_INFO, format, ap);
+    va_end(ap);
+}
+
+static int native_dv_diag_hash(AVCodecContext *avctx, MediaCodecNativeDvDiag *d,
+                               const uint8_t *data, size_t size, char hex[65])
+{
+    struct AVSHA *sha;
+    uint8_t digest[32];
+    static const char digits[] = "0123456789abcdef";
+    int i;
+
+    if (!native_dv_diag_allow(avctx, d))
+        return 0;
+    sha = av_sha_alloc();
+    if (!sha || av_sha_init(sha, 256) < 0 || (size && !data)) {
+        av_free(sha);
+        ff_mediacodec_diag_log(avctx, d,
+               "native_dv_diag decoder=%"PRIu64" event=disabled reason=hash_unavailable\n",
+               d->decoder_id);
+        d->enabled = d->capture_au = 0;
+        return 0;
+    }
+    if (size)
+        av_sha_update(sha, data, size);
+    av_sha_final(sha, digest);
+    av_free(sha);
+    for (i = 0; i < 32; i++) {
+        hex[2 * i] = digits[digest[i] >> 4];
+        hex[2 * i + 1] = digits[digest[i] & 15];
+    }
+    hex[64] = 0;
+    return 1;
+}
+
+void ff_mediacodec_diag_begin(AVCodecContext *avctx, MediaCodecNativeDvDiag *d,
+                             int enabled)
+{
+    if (!enabled)
+        return;
+    d->requested = d->enabled = 1;
+    d->decoder_id = atomic_fetch_add(&native_dv_diag_next_id, 1) + 1;
+    ff_mediacodec_diag_log(avctx, d,
+           "native_dv_diag decoder=%"PRIu64" epoch=0 event=begin max_epochs=8 max_aus=96 max_nals=16 max_fragments=16 max_events=4096\n",
+           d->decoder_id);
+}
+
+void ff_mediacodec_diag_blob(AVCodecContext *avctx, MediaCodecNativeDvDiag *d,
+                            const char *event, const uint8_t *data, size_t size)
+{
+    char hex[65];
+    if (native_dv_diag_hash(avctx, d, data, size, hex))
+        ff_mediacodec_diag_log(avctx, d,
+               "native_dv_diag decoder=%"PRIu64" epoch=%d event=%s len=%zu sha256=%s\n",
+               d->decoder_id, d->epoch, event, size, hex);
+}
+
+/* Annex-B start codes only: do not guess an RPU's meaning or parse its body. */
+static int native_dv_diag_start_code(const uint8_t *data, int size, int from,
+                                     int *header)
+{
+    int i;
+    for (i = from; i <= size - 3; i++) {
+        if (data[i] || data[i + 1])
+            continue;
+        if (data[i + 2] == 1) {
+            *header = i + 3;
+            return i;
+        }
+        if (i <= size - 4 && !data[i + 2] && data[i + 3] == 1) {
+            *header = i + 4;
+            return i;
+        }
+    }
+    return -1;
+}
+
+void ff_mediacodec_diag_au(AVCodecContext *avctx, MediaCodecNativeDvDiag *d,
+                          const AVPacket *pkt)
+{
+    char hex[65];
+    char nals[512] = { 0 };
+    int header, start, next, next_header, count = 0, malformed = 0;
+    int vps = 0, sps = 0, pps = 0, rpu = 0, used = 0;
+
+    if (!native_dv_diag_allow(avctx, d))
+        return;
+    d->capture_au = 0;
+    d->au_seq++;
+    if (d->epoch >= 8)
+        return;
+    if (d->au_count >= 96) {
+        if (!d->au_limit_logged) {
+            d->au_limit_logged = 1;
+            ff_mediacodec_diag_log(avctx, d,
+                   "native_dv_diag decoder=%"PRIu64" epoch=%d event=au_limit\n",
+                   d->decoder_id, d->epoch);
+        }
+        return;
+    }
+    if (pkt->size < 0) {
+        ff_mediacodec_diag_log(avctx, d,
+               "native_dv_diag decoder=%"PRIu64" event=disabled reason=negative_au_size\n",
+               d->decoder_id);
+        d->enabled = 0;
+        return;
+    }
+    if (!native_dv_diag_hash(avctx, d, pkt->data, pkt->size, hex))
+        return;
+    d->au_count++;
+    d->au_offset = d->fragment_seq = 0;
+    d->au_size = pkt->size;
+    d->capture_au = pkt->size > 0;
+    start = native_dv_diag_start_code(pkt->data, pkt->size, 0, &header);
+    if (start != 0)
+        malformed++;
+    while (start >= 0) {
+        int len, type = -1;
+        next_header = 0;
+        next = native_dv_diag_start_code(pkt->data, pkt->size, header, &next_header);
+        len = (next >= 0 ? next : pkt->size) - header;
+        if (len < 2 || (pkt->data[header] & 0x80) || !(pkt->data[header + 1] & 7)) {
+            malformed++;
+        } else {
+            type = (pkt->data[header] >> 1) & 63;
+            vps += type == 32;
+            sps += type == 33;
+            pps += type == 34;
+            rpu += type == 62;
+        }
+        if (count < 16)
+            used += snprintf(nals + used, sizeof(nals) - used, "%s%d:%d",
+                             count ? "," : "", type, len);
+        count++;
+        start = next;
+        header = next_header;
+    }
+    ff_mediacodec_diag_log(avctx, d,
+           "native_dv_diag decoder=%"PRIu64" epoch=%d event=au au=%"PRIu64
+           " pts=%"PRId64" dts=%"PRId64" tb=%d/%d len=%d sha256=%s"
+           " nal_count=%d vps=%d sps=%d pps=%d rpu=%d malformed=%d nals=%s\n",
+           d->decoder_id, d->epoch, d->au_seq, pkt->pts, pkt->dts,
+           avctx->pkt_timebase.num, avctx->pkt_timebase.den, pkt->size, hex,
+           count, vps, sps, pps, rpu, malformed, nals);
+}
+
+static int native_dv_diag_queue(AVCodecContext *avctx, MediaCodecNativeDvDiag *d,
+                                size_t capacity, const uint8_t *data,
+                                size_t size, int64_t pts, uint32_t flags, int eos)
+{
+    char hex[65];
+    if (!d->enabled || d->epoch >= 8 ||
+        (eos ? d->eos_logged : !d->capture_au))
+        return 0;
+    /* Reserve both queue-before and queue-result before touching SHA. */
+    if (d->event_count >= 4094) {
+        native_dv_diag_limit(avctx, d);
+        return 0;
+    }
+    if (!eos && d->fragment_seq >= 16) {
+        ff_mediacodec_diag_log(avctx, d,
+               "native_dv_diag decoder=%"PRIu64" epoch=%d event=au_fragment_limit au=%"PRIu64" max_fragments=16\n",
+               d->decoder_id, d->epoch, d->au_seq);
+        d->capture_au = 0;
+        return 0;
+    }
+    if (!eos && (!size || size > d->au_size || d->au_offset > d->au_size - size)) {
+        ff_mediacodec_diag_log(avctx, d,
+               "native_dv_diag decoder=%"PRIu64" event=disabled reason=au_offset\n",
+               d->decoder_id);
+        d->enabled = d->capture_au = 0;
+        return 0;
+    }
+    if (!native_dv_diag_hash(avctx, d, data, size, hex))
+        return 0;
+    if (eos)
+        d->eos_logged = 1;
+    else
+        d->fragment_seq++;
+    ff_mediacodec_diag_log(avctx, d,
+           "native_dv_diag decoder=%"PRIu64" epoch=%d event=%s au=%"PRIu64
+           " fragment=%"PRIu64" au_offset=%"PRIu64" capacity=%zu len=%zu pts_us=%"PRId64
+           " flags=%u sha256=%s\n",
+           d->decoder_id, d->epoch, eos ? "eos_queue" : "queue",
+           eos ? 0 : d->au_seq, eos ? 0 : d->fragment_seq,
+           eos ? 0 : d->au_offset, capacity, size, pts, flags, hex);
+    return 1;
+}
+
+static void native_dv_diag_queue_result(AVCodecContext *avctx, MediaCodecNativeDvDiag *d,
+                                       int captured, size_t size, int status, int eos)
+{
+    if (!captured)
+        return;
+    ff_mediacodec_diag_log(avctx, d,
+           "native_dv_diag decoder=%"PRIu64" epoch=%d event=%s au=%"PRIu64
+           " fragment=%"PRIu64" status=%d\n",
+           d->decoder_id, d->epoch, eos ? "eos_result" : "queue_result",
+           eos ? 0 : d->au_seq, eos ? 0 : d->fragment_seq, status);
+    if (!eos && status >= 0) {
+        d->au_offset += size;
+        if (d->au_offset == d->au_size)
+            d->capture_au = 0;
+    }
+}
+
+static void native_dv_diag_flush(AVCodecContext *avctx, MediaCodecNativeDvDiag *d,
+                                int status)
+{
+    if (!d->enabled || d->epoch >= 8 || (status < 0 && d->flush_failed_logged))
+        return;
+    if (status < 0)
+        d->flush_failed_logged = 1;
+    ff_mediacodec_diag_log(avctx, d,
+           "native_dv_diag decoder=%"PRIu64" epoch=%d event=flush status=%d\n",
+           d->decoder_id, d->epoch, status);
+    if (status < 0)
+        return;
+    d->epoch++;
+    d->au_count = d->au_limit_logged = d->capture_au = d->eos_logged = 0;
+    d->flush_failed_logged = 0;
+    d->au_offset = d->fragment_seq = 0;
+    if (d->epoch == 8 && !d->epoch_limit_logged++)
+        ff_mediacodec_diag_log(avctx, d,
+               "native_dv_diag decoder=%"PRIu64" event=epoch_limit\n", d->decoder_id);
+}
+
+void ff_mediacodec_diag_close(AVCodecContext *avctx, MediaCodecNativeDvDiag *d)
+{
+    if (!d->requested || d->closed)
+        return;
+    av_log(avctx, AV_LOG_INFO,
+           "native_dv_diag decoder=%"PRIu64" epoch=%d event=close enabled=%d\n",
+           d->decoder_id, d->epoch, d->enabled);
+    d->closed = 1;
+    d->enabled = d->capture_au = 0;
+}
 
 #define INPUT_DEQUEUE_TIMEOUT_US 8000
 #define OUTPUT_DEQUEUE_TIMEOUT_US 8000
@@ -728,6 +1005,7 @@ static int mediacodec_dec_flush_codec(AVCodecContext *avctx, MediaCodecDecContex
     s->current_input_buffer = -1;
 
     status = ff_AMediaCodec_flush(codec);
+    native_dv_diag_flush(avctx, &s->native_dv_diag, status);
     if (status < 0) {
         av_log(avctx, AV_LOG_ERROR, "Failed to flush codec\n");
         return AVERROR_EXTERNAL;
@@ -740,6 +1018,7 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
                                           const char *mime, FFAMediaFormat *format)
 {
     int profile;
+    int native_dv = !strcmp(mime, "video/dolby-vision");
 
     enum AVPixelFormat pix_fmt;
     static const enum AVPixelFormat pix_fmts[] = {
@@ -768,13 +1047,36 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
         }
     }
 
-    profile = ff_AMediaCodecProfile_getProfileFromAVCodecContext(avctx);
-    if (profile < 0) {
-        av_log(avctx, AV_LOG_WARNING, "Unsupported or unknown profile\n");
+    if (native_dv) {
+        int32_t format_profile;
+
+        if (!s->surface) {
+            av_log(avctx, AV_LOG_ERROR, "native_dv requires Surface output; copy decoding is unsupported\n");
+            return AVERROR(EINVAL);
+        }
+        if (avctx->codec_id != AV_CODEC_ID_HEVC ||
+            !ff_AMediaFormat_getInt32(format, "profile", &format_profile) ||
+            format_profile != 0x20) {
+            av_log(avctx, AV_LOG_ERROR, "native_dv requires explicit Android P5 profile 0x20\n");
+            return AVERROR_INVALIDDATA;
+        }
+        profile = format_profile;
+        av_log(avctx, AV_LOG_INFO,
+               "native_dv selecting Surface decoder: MIME=%s, profile=0x%x\n", mime, profile);
+    } else {
+        profile = ff_AMediaCodecProfile_getProfileFromAVCodecContext(avctx);
+        if (profile < 0)
+            av_log(avctx, AV_LOG_WARNING, "Unsupported or unknown profile\n");
     }
 
     s->codec_name = ff_AMediaCodecList_getCodecNameByType(mime, profile, 0, avctx);
     if (!s->codec_name) {
+        if (native_dv) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "native_dv found no matching decoder for MIME=%s profile=0x%x; no fallback\n",
+                   mime, profile);
+            return AVERROR_EXTERNAL;
+        }
         // getCodecNameByType() can fail due to missing JVM, while NDK
         // mediacodec can be used without JVM.
         if (!s->use_ndk_codec) {
@@ -784,6 +1086,10 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
     } else {
         av_log(avctx, AV_LOG_DEBUG, "Found decoder %s\n", s->codec_name);
     }
+
+    if (native_dv)
+        av_log(avctx, AV_LOG_INFO, "native_dv selected codec=%s MIME=%s profile=0x%x\n",
+               s->codec_name, mime, profile);
 
     if (s->codec_name)
         s->codec = ff_AMediaCodec_createCodecByName(s->codec_name, s->use_ndk_codec);
@@ -843,6 +1149,10 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
     if (ret < 0)
         goto fail;
 
+    if (s->native_dv_diag.enabled)
+        ff_mediacodec_diag_log(avctx, &s->native_dv_diag,
+               "native_dv_diag decoder=%"PRIu64" epoch=%d event=configure mime=%s profile=32 surface_present=%d\n",
+               s->native_dv_diag.decoder_id, s->native_dv_diag.epoch, mime, !!s->surface);
     status = ff_AMediaCodec_configure(s->codec, format, s->surface, NULL, 0);
     if (status < 0) {
         char *desc = ff_AMediaFormat_toString(format);
@@ -882,6 +1192,10 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
     return 0;
 
 fail:
+    if (s->native_dv_diag.requested)
+        av_log(avctx, AV_LOG_INFO,
+               "native_dv_diag decoder=%"PRIu64" event=init_failed status=%d\n",
+               s->native_dv_diag.decoder_id, ret);
     av_log(avctx, AV_LOG_ERROR, "MediaCodec %p failed to start\n", s->codec);
     ff_mediacodec_dec_close(avctx, s);
     return ret;
@@ -900,6 +1214,8 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
                            AVPacket *pkt, bool wait)
 {
     int offset = 0;
+    int diag_captured;
+    size_t diag_capacity;
     int need_draining = 0;
     uint8_t *data;
     size_t size;
@@ -953,7 +1269,11 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
 
             av_log(avctx, AV_LOG_DEBUG, "Sending End Of Stream signal\n");
 
+            diag_captured = native_dv_diag_queue(avctx, &s->native_dv_diag,
+                                                 size, NULL, 0, pts, flags, 1);
             status = ff_AMediaCodec_queueInputBuffer(codec, index, 0, 0, pts, flags);
+            native_dv_diag_queue_result(avctx, &s->native_dv_diag,
+                                        diag_captured, 0, status, 1);
             if (status < 0) {
                 av_log(avctx, AV_LOG_ERROR, "Failed to queue input empty buffer (status = %d)\n", status);
                 return AVERROR_EXTERNAL;
@@ -966,11 +1286,16 @@ int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
             return 0;
         }
 
+        diag_capacity = size;
         size = FFMIN(pkt->size - offset, size);
         memcpy(data, pkt->data + offset, size);
         offset += size;
 
+        diag_captured = native_dv_diag_queue(avctx, &s->native_dv_diag,
+                                             diag_capacity, data, size, pts, 0, 0);
         status = ff_AMediaCodec_queueInputBuffer(codec, index, 0, size, pts, 0);
+        native_dv_diag_queue_result(avctx, &s->native_dv_diag,
+                                    diag_captured, size, status, 0);
         if (status < 0) {
             av_log(avctx, AV_LOG_ERROR, "Failed to queue input buffer (status = %d)\n", status);
             return AVERROR_EXTERNAL;
@@ -1137,6 +1462,8 @@ int ff_mediacodec_dec_close(AVCodecContext *avctx, MediaCodecDecContext *s)
 {
     if (!s)
         return 0;
+
+    ff_mediacodec_diag_close(avctx, &s->native_dv_diag);
 
     if (s->codec) {
         if (atomic_load(&s->hw_buffer_count) == 0) {

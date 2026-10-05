@@ -12,6 +12,7 @@ OBJS = allformats.o         \
        aviobuf.o            \
        demux.o              \
        demux_utils.o        \
+       hevc_ps_probe.o      \
        dump.o               \
        dv.o                 \
        format.o             \

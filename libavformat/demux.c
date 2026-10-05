@@ -26,6 +26,7 @@
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/dict.h"
+#include "libavutil/dovi_meta.h"
 #include "libavutil/internal.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
@@ -46,6 +47,7 @@
 #include "avio_internal.h"
 #include "demux.h"
 #include "id3v2.h"
+#include "hevc_ps_probe.h"
 #include "internal.h"
 #include "url.h"
 
@@ -2537,6 +2539,226 @@ static int extract_extradata(FFFormatContext *si, AVStream *st, const AVPacket *
     return 0;
 }
 
+/* Initial MOV probe only; no claim about later parameter-set versions. */
+static int native_dv_ps_candidate(const AVStream *st)
+{
+    const AVCodecParameters *par = st->codecpar;
+    const AVPacketSideData *sd;
+    const AVDOVIDecoderConfigurationRecord *d;
+
+    if (par->codec_type != AVMEDIA_TYPE_VIDEO || par->codec_id != AV_CODEC_ID_HEVC ||
+        par->extradata_size < 23 || !par->extradata || par->extradata[0] != 1)
+        return 0;
+    sd = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data,
+                                AV_PKT_DATA_DOVI_CONF);
+    if (!sd || !sd->data || sd->size < sizeof(*d))
+        return 0;
+    d = (const void *)sd->data;
+    return d->dv_version_major == 1 && d->dv_version_minor == 0 &&
+           d->dv_profile == 5 && d->bl_present_flag == 1 &&
+           d->rpu_present_flag == 1 && d->el_present_flag == 0;
+}
+
+/* Bounded, per-call state; no AVFormatContext/FFStream ABI extension. */
+typedef struct InitialDoviPS {
+    FFHEVCPSProbe *probe;
+    uint8_t *replacement;
+    uint8_t *context_replacement;
+    int replacement_size;
+    int update_context;
+} InitialDoviPS;
+
+int avformat_complete_initial_dovi_hvcc(AVFormatContext *s,
+                                      int64_t max_bytes, int max_packets)
+{
+    size_t workspace_limit;
+    unsigned nb_streams;
+    FFFormatContext *si;
+    InitialDoviPS *tracks = NULL;
+    PacketListEntry *buffered;
+    int candidates = 0, remaining, count = 0, ret = 0;
+    int64_t bytes = 0;
+    size_t track_bytes, per_track;
+
+    if (!s || !s->iformat || max_bytes <= 0 || max_packets <= 0)
+        return AVERROR(EINVAL);
+    if (!av_match_name("mov", s->iformat->name))
+        return 0;
+    nb_streams = s->nb_streams;
+    for (unsigned i = 0; i < nb_streams; i++) {
+        AVStream *st = s->streams[i];
+        if (!native_dv_ps_candidate(st))
+            continue;
+        ret = ff_hevc_ps_probe_missing_types(st->codecpar->extradata,
+                                              st->codecpar->extradata_size);
+        if (ret < 0)
+            return ret;
+        candidates += ret;
+    }
+    if (!candidates)
+        return 0;
+    if (s->flags & AVFMT_FLAG_NOBUFFER)
+        return AVERROR(EINVAL);
+    max_bytes = FFMIN(max_bytes, FFMIN(s->probesize, 8 * 1024 * 1024));
+    max_packets = FFMIN(max_packets, 64);
+    if (max_bytes <= 0)
+        return AVERROR(EINVAL);
+    workspace_limit = FFMIN(max_bytes, 2 * 1024 * 1024);
+    si = ffformatcontext(s);
+    if (workspace_limit <= 131072 ||
+        nb_streams > (workspace_limit - 131072) / sizeof(*tracks))
+        return AVERROR(ENOSPC);
+    track_bytes = nb_streams * sizeof(*tracks);
+    /* Each helper owns its original+PS and a bounded build; reserve a second
+     * replacement, allocation padding and one transient <=65535-byte RBSP. */
+    per_track = (workspace_limit - track_bytes - 131072) / (4 * (size_t)candidates);
+    tracks = av_calloc(nb_streams, sizeof(*tracks));
+    if (!tracks)
+        return AVERROR(ENOMEM);
+    candidates = 0;
+    for (unsigned i = 0; i < nb_streams; i++) {
+        AVStream *st = s->streams[i];
+        if (!native_dv_ps_candidate(st) ||
+            ff_hevc_ps_probe_missing_types(st->codecpar->extradata,
+                                            st->codecpar->extradata_size) == 0)
+            continue;
+        ret = ff_hevc_ps_probe_init(&tracks[i].probe, st->codecpar->extradata,
+                                    st->codecpar->extradata_size,
+                                    max_bytes, per_track);
+        if (ret < 0)
+            goto end;
+        if (ret > 0) {
+            if (avcodec_is_open(ffstream(st)->avctx)) {
+                ret = AVERROR(EBUSY);
+                goto end;
+            }
+            candidates++;
+        }
+    }
+    if (!candidates) {
+        ret = 0;
+        goto end;
+    }
+    remaining = candidates;
+    buffered = si->packet_buffer.head;
+    while (remaining && count < max_packets && bytes < max_bytes) {
+        AVPacket *pkt;
+        if (ff_check_interrupt(&s->interrupt_callback)) {
+            ret = AVERROR_EXIT;
+            goto end;
+        }
+        if (buffered) {
+            pkt = &buffered->pkt;
+            buffered = buffered->next;
+        } else {
+            /* Reserve the list node BEFORE consuming a packet: appending the
+             * successful normal read has no fallible allocation or copy. */
+            PacketListEntry *entry = av_mallocz(sizeof(*entry));
+            if (!entry) {
+                ret = AVERROR(ENOMEM);
+                goto end;
+            }
+            ret = read_frame_internal(s, &entry->pkt);
+            if (ret < 0) {
+                av_packet_unref(&entry->pkt);
+                av_free(entry);
+                goto end;
+            }
+            if (si->packet_buffer.tail)
+                si->packet_buffer.tail->next = entry;
+            else
+                si->packet_buffer.head = entry;
+            si->packet_buffer.tail = entry;
+            pkt = &entry->pkt;
+        }
+        count++;
+        if (pkt->size < 0 || pkt->size > max_bytes - bytes) {
+            ret = AVERROR(ENOSPC); /* retained overshoot; do not inspect */
+            goto end;
+        }
+        bytes += pkt->size;
+        if (s->nb_streams != nb_streams ||
+            pkt->stream_index < 0 || pkt->stream_index >= nb_streams) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
+        if (tracks[pkt->stream_index].probe) {
+            int was_pending = ff_hevc_ps_probe_pending(tracks[pkt->stream_index].probe);
+            ret = ff_hevc_ps_probe_feed(tracks[pkt->stream_index].probe,
+                                        pkt->data, pkt->size);
+            if (ret < 0)
+                goto end;
+            if (was_pending && ret > 0)
+                remaining--;
+        }
+    }
+    if (remaining) {
+        ret = AVERROR(ENOSPC);
+        goto end;
+    }
+    /* No fallible operation is allowed after publication starts. */
+    for (unsigned i = 0; i < nb_streams; i++) {
+        AVStream *st = s->streams[i];
+        FFStream *sti = ffstream(st);
+        InitialDoviPS *t = &tracks[i];
+        if (!t->probe)
+            continue;
+        t->update_context = sti->avctx_inited || sti->avctx->extradata != NULL;
+        if (!native_dv_ps_candidate(st) ||
+            avcodec_is_open(sti->avctx) ||
+            !ff_hevc_ps_probe_matches(t->probe, st->codecpar->extradata,
+                                      st->codecpar->extradata_size) ||
+            (t->update_context &&
+             !ff_hevc_ps_probe_matches(t->probe, sti->avctx->extradata,
+                                       sti->avctx->extradata_size))) {
+            ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
+        ret = ff_hevc_ps_probe_build(t->probe, &t->replacement, &t->replacement_size);
+        if (ret <= 0) {
+            if (!ret)
+                ret = AVERROR_INVALIDDATA;
+            goto end;
+        }
+        if (t->update_context) {
+            t->context_replacement = av_mallocz(t->replacement_size + AV_INPUT_BUFFER_PADDING_SIZE);
+            if (!t->context_replacement) {
+                ret = AVERROR(ENOMEM);
+                goto end;
+            }
+            memcpy(t->context_replacement, t->replacement, t->replacement_size);
+        }
+    }
+    for (unsigned i = 0; i < nb_streams; i++) {
+        AVStream *st = s->streams[i];
+        FFStream *sti = ffstream(st);
+        InitialDoviPS *t = &tracks[i];
+        if (!t->probe)
+            continue;
+        av_freep(&st->codecpar->extradata);
+        st->codecpar->extradata = t->replacement;
+        st->codecpar->extradata_size = t->replacement_size;
+        t->replacement = NULL;
+        if (t->update_context) {
+            av_freep(&sti->avctx->extradata);
+            sti->avctx->extradata = t->context_replacement;
+            sti->avctx->extradata_size = t->replacement_size;
+            t->context_replacement = NULL;
+        }
+    }
+    ret = candidates;
+end:
+    if (tracks) {
+        for (unsigned i = 0; i < nb_streams; i++) {
+            ff_hevc_ps_probe_free(&tracks[i].probe);
+            av_free(tracks[i].replacement);
+            av_free(tracks[i].context_replacement);
+        }
+        av_free(tracks);
+    }
+    return ret;
+}
+
 int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
 {
     FFFormatContext *const si = ffformatcontext(ic);
@@ -2546,6 +2768,8 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
     int64_t old_offset  = avio_tell(ic->pb);
     // new streams might appear, no options for those
     int orig_nb_streams = ic->nb_streams;
+    FFHEVCPSProbe **native_dv_ps = NULL;
+    size_t native_dv_ps_storage = 0;
     int flush_codecs;
     int64_t max_analyze_duration = ic->max_analyze_duration;
     int64_t max_stream_analyze_duration;
@@ -2574,6 +2798,21 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
         FFIOContext *const ctx = ffiocontext(ic->pb);
         av_log(ic, AV_LOG_DEBUG, "Before avformat_find_stream_info() pos: %"PRId64" bytes read:%"PRId64" seeks:%d nb_streams:%d\n",
                avio_tell(ic->pb), ctx->bytes_read, ctx->seek_count, ic->nb_streams);
+    }
+
+    if (!strcmp(ic->iformat->name, "mov,mp4,m4a,3gp,3g2,mj2") && probesize > 0) {
+        unsigned candidates = 0;
+        for (unsigned i = 0; i < orig_nb_streams; i++)
+            candidates += native_dv_ps_candidate(ic->streams[i]);
+        if (candidates && !(ic->flags & AVFMT_FLAG_NOBUFFER)) {
+            size_t budget = FFMIN(probesize, 1024 * 1024);
+            if (orig_nb_streams <= budget / sizeof(*native_dv_ps)) {
+                native_dv_ps = av_calloc(orig_nb_streams, sizeof(*native_dv_ps));
+                native_dv_ps_storage = (budget - orig_nb_streams * sizeof(*native_dv_ps)) / candidates;
+            }
+        } else if (candidates) {
+            av_log(ic, AV_LOG_VERBOSE, "native_dv_ps_probe skipped: NOBUFFER retains no replayable probe packets\n");
+        }
     }
 
     for (unsigned i = 0; i < ic->nb_streams; i++) {
@@ -2605,6 +2844,16 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
             goto find_stream_info_err;
         if (sti->request_probe <= 0)
             sti->avctx_inited = 1;
+
+        if (native_dv_ps && i < orig_nb_streams && native_dv_ps_candidate(st)) {
+            size_t scan_budget = (uint64_t)probesize > SIZE_MAX ? SIZE_MAX : probesize;
+            int ps_ret = ff_hevc_ps_probe_init(&native_dv_ps[i], avctx->extradata,
+                                                avctx->extradata_size,
+                                                scan_budget, native_dv_ps_storage);
+            if (ps_ret < 0)
+                av_log(ic, AV_LOG_VERBOSE,
+                       "native_dv_ps_probe stream=%u event=unrepaired init_status=%d\n", i, ps_ret);
+        }
 
         codec = find_probe_decoder(ic, st, st->codecpar->codec_id);
 
@@ -2639,6 +2888,7 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
         FFStream *sti;
         AVCodecContext *avctx;
         int analyzed_all_streams;
+        int ps_only_probe = 0;
         unsigned i;
         if (ff_check_interrupt(&ic->interrupt_callback)) {
             ret = AVERROR_EXIT;
@@ -2697,11 +2947,17 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
                 /* NOTE: If the format has no header, then we need to read some
                  * packets to get most of the streams, so we cannot stop here. */
                 if (!(ic->ctx_flags & AVFMTCTX_NOHEADER)) {
-                    /* If we found the info for all the codecs, we can stop. */
-                    ret = count;
-                    av_log(ic, AV_LOG_DEBUG, "All info found\n");
-                    flush_codecs = 0;
-                    break;
+                    /* Preserve the original stop decision independently of PS.
+                     * Only supplemental PS reads must avoid opening a decoder. */
+                    if (native_dv_ps)
+                        for (unsigned j = 0; j < orig_nb_streams; j++)
+                            ps_only_probe |= ff_hevc_ps_probe_pending(native_dv_ps[j]);
+                    if (!ps_only_probe) {
+                        ret = count;
+                        av_log(ic, AV_LOG_DEBUG, "All info found\n");
+                        flush_codecs = 0;
+                        break;
+                    }
                 }
             }
         /* We did not get all the codec info, but we read too much data. */
@@ -2852,6 +3108,18 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
                 goto unref_then_goto_end;
         }
 
+        if (native_dv_ps && pkt->stream_index >= 0 && pkt->stream_index < orig_nb_streams &&
+            native_dv_ps[pkt->stream_index]) {
+            int ps_ret = ff_hevc_ps_probe_feed(native_dv_ps[pkt->stream_index],
+                                               pkt->data, pkt->size);
+            if (ps_ret < 0) {
+                av_log(ic, AV_LOG_VERBOSE,
+                       "native_dv_ps_probe stream=%d event=unrepaired feed_status=%d\n",
+                       pkt->stream_index, ps_ret);
+                ff_hevc_ps_probe_free(&native_dv_ps[pkt->stream_index]);
+            }
+        }
+
         /* If still no information, we try to open the codec and to
          * decompress the frame. We try to avoid that in most cases as
          * it takes longer and uses more memory. For MPEG-4, we need to
@@ -2861,8 +3129,10 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
          * least one frame of codec data, this makes sure the codec initializes
          * the channel configuration and does not only trust the values from
          * the container. */
-        try_decode_frame(ic, st, pkt,
-                         (options && i < orig_nb_streams) ? &options[i] : NULL);
+        if (!ps_only_probe || !has_codec_parameters(st, NULL) ||
+            !has_decode_delay_been_guessed(st))
+            try_decode_frame(ic, st, pkt,
+                             (options && i < orig_nb_streams) ? &options[i] : NULL);
 
         if (ic->flags & AVFMT_FLAG_NOBUFFER)
             av_packet_unref(pkt1);
@@ -3062,6 +3332,26 @@ int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options)
         AVStream *const st  = ic->streams[i];
         FFStream *const sti = ffstream(st);
 
+        if (native_dv_ps && i < orig_nb_streams && native_dv_ps[i] && sti->avctx_inited) {
+            uint8_t *replacement = NULL;
+            int replacement_size = 0;
+            int ps_ret = 0;
+            if (ff_hevc_ps_probe_matches(native_dv_ps[i], sti->avctx->extradata,
+                                         sti->avctx->extradata_size))
+                ps_ret = ff_hevc_ps_probe_build(native_dv_ps[i], &replacement, &replacement_size);
+            if (ps_ret == 1) {
+                av_freep(&sti->avctx->extradata);
+                sti->avctx->extradata = replacement;
+                sti->avctx->extradata_size = replacement_size;
+                av_log(ic, AV_LOG_VERBOSE,
+                       "native_dv_ps_probe stream=%u event=initial_hvcc_completed len=%d\n",
+                       i, replacement_size);
+            } else {
+                av_log(ic, AV_LOG_VERBOSE,
+                       "native_dv_ps_probe stream=%u event=unrepaired final_status=%d\n", i, ps_ret);
+            }
+        }
+
         if (sti->avctx_inited) {
             ret = avcodec_parameters_from_context(st->codecpar, sti->avctx);
             if (ret < 0)
@@ -3116,6 +3406,11 @@ FF_ENABLE_DEPRECATION_WARNINGS
     }
 
 find_stream_info_err:
+    if (native_dv_ps) {
+        for (unsigned i = 0; i < orig_nb_streams; i++)
+            ff_hevc_ps_probe_free(&native_dv_ps[i]);
+        av_freep(&native_dv_ps);
+    }
     for (unsigned i = 0; i < ic->nb_streams; i++) {
         AVStream *const st  = ic->streams[i];
         FFStream *const sti = ffstream(st);

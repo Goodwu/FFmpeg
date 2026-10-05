@@ -2315,6 +2315,37 @@ int avformat_open_input(AVFormatContext **ps, const char *url,
 int avformat_find_stream_info(AVFormatContext *ic, AVDictionary **options);
 
 /**
+ * Complete missing initial MOV Dolby Vision profile 5 HEVC parameter sets.
+ * Call after avformat_open_input(), before handing any packet to a consumer.
+ * This optional initialization does not open a decoder, seek, or change packet
+ * contents. Packets already buffered are examined first; further normal demux
+ * packets are retained in order for subsequent av_read_frame() calls.
+ * Only valid profile 5 BL+RPU/no-EL hvcC with a missing PS type is considered.
+ * Complete hvcC and other streams are left unchanged. All candidates publish
+ * together, including their initialized demux codec contexts; no partial
+ * replacement is published on failure. Later PS versions are outside scope.
+ *
+ * @param max_bytes Positive scan budget, capped at 8 MiB and s->probesize.
+ *                  A read can retain one complete packet beyond this budget;
+ *                  that packet is not examined and no replacement is published.
+ * @param max_packets Positive packet budget, capped at 64 (including buffered
+ *                    packets examined). Existing buffered packets are not lost.
+ * @return Number of streams repaired, 0 only for no missing-PS candidate;
+ *         negative AVERROR for unrepaired candidates (ENOSPC on budget,
+ *         EOF/EAGAIN from demux), invalid input, NOBUFFER, interruption,
+ *         malformed PS, allocation or demux error.
+ *         On every return, successfully demuxed packets remain buffered.
+ * @note A fixed allocation-free preflight uses less than 4 KiB stack space.
+ *       When repair is required, the total extra PS/replacement workspace is
+ *       bounded at min(max_bytes, 2 MiB), separately
+ *       from packet buffering. Packet buffering has the one-packet overshoot
+ *       described above, rather than a strict byte bound. Not thread-safe.
+ */
+int avformat_complete_initial_dovi_hvcc(AVFormatContext *s,
+                                      int64_t max_bytes, int max_packets);
+
+
+/**
  * Find the programs which belong to a given stream.
  *
  * @param ic    media file handle

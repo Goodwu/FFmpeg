@@ -34,6 +34,37 @@
 #include "avcodec.h"
 #include "mediacodec_wrapper.h"
 
+/* Optional bounded input evidence. No borrowed decoder-private pointers. */
+typedef struct MediaCodecNativeDvDiag {
+    int requested;
+    int enabled;
+    int closed;
+    int epoch;
+    int epoch_limit_logged;
+    int au_limit_logged;
+    int flush_failed_logged;
+    int event_count;
+    int event_limit_logged;
+    int au_count;
+    int capture_au;
+    int eos_logged;
+    uint64_t decoder_id;
+    uint64_t au_seq;
+    uint64_t au_offset;
+    uint64_t fragment_seq;
+    size_t au_size;
+} MediaCodecNativeDvDiag;
+
+void ff_mediacodec_diag_log(AVCodecContext *avctx, MediaCodecNativeDvDiag *d,
+                           const char *format, ...) av_printf_format(3, 4);
+void ff_mediacodec_diag_begin(AVCodecContext *avctx, MediaCodecNativeDvDiag *d,
+                             int enabled);
+void ff_mediacodec_diag_blob(AVCodecContext *avctx, MediaCodecNativeDvDiag *d,
+                            const char *event, const uint8_t *data, size_t size);
+void ff_mediacodec_diag_au(AVCodecContext *avctx, MediaCodecNativeDvDiag *d,
+                          const AVPacket *pkt);
+void ff_mediacodec_diag_close(AVCodecContext *avctx, MediaCodecNativeDvDiag *d);
+
 typedef struct MediaCodecDecContext {
 
     AVCodecContext *avctx;
@@ -71,6 +102,7 @@ typedef struct MediaCodecDecContext {
     atomic_int serial;
 
     bool use_ndk_codec;
+    MediaCodecNativeDvDiag native_dv_diag;
 } MediaCodecDecContext;
 
 int ff_mediacodec_dec_init(AVCodecContext *avctx,

@@ -27,6 +27,7 @@
 
 #include "libavutil/avassert.h"
 #include "libavutil/common.h"
+#include "libavutil/dovi_meta.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/intreadwrite.h"
@@ -60,13 +61,56 @@ typedef struct MediaCodecH264DecContext {
     int use_ndk_codec;
 
     int dovi;
+    int native_dv;
+    int native_dv_diag;
+    int native_dv_api_version;
+    int native_dv_active;
+    char *mediacodec_mime;
+    char *mediacodec_name;
     FFMediacodecDovi *dovi_export;
 } MediaCodecH264DecContext;
+
+/* Runtime facts describe codec configuration, not visible/HDR acceptance. */
+static void mediacodec_clear_runtime_facts(MediaCodecH264DecContext *s)
+{
+    s->native_dv_active = 0;
+    av_freep(&s->mediacodec_mime);
+    av_freep(&s->mediacodec_name);
+}
+
+static int mediacodec_publish_runtime_facts(AVCodecContext *avctx,
+                                           const char *mime)
+{
+    MediaCodecH264DecContext *s = avctx->priv_data;
+    char *mime_copy;
+    char *name_copy;
+
+    if (!s->ctx || !s->ctx->codec || !s->ctx->codec_name || !mime)
+        return AVERROR_EXTERNAL;
+
+    mime_copy = av_strdup(mime);
+    /* NDK fallback uses the MIME as codec_name when getName is unavailable.
+     * Export an owned empty string for an unknown name, not a fabricated one. */
+    name_copy = av_strdup(strcmp(s->ctx->codec_name, mime) ? s->ctx->codec_name : "");
+    if (!mime_copy || !name_copy) {
+        av_free(mime_copy);
+        av_free(name_copy);
+        return AVERROR(ENOMEM);
+    }
+
+    mediacodec_clear_runtime_facts(s);
+    s->mediacodec_mime = mime_copy;
+    s->mediacodec_name = name_copy;
+    s->native_dv_active = s->native_dv && s->ctx->surface &&
+                          !strcmp(mime, "video/dolby-vision");
+    return 0;
+}
 
 static av_cold int mediacodec_decode_close(AVCodecContext *avctx)
 {
     MediaCodecH264DecContext *s = avctx->priv_data;
 
+    mediacodec_clear_runtime_facts(s);
     ff_mediacodec_dovi_free(avctx, &s->dovi_export);
 
     ff_mediacodec_dec_close(avctx, s->ctx);
@@ -198,10 +242,12 @@ done:
 #endif
 
 #if CONFIG_HEVC_MEDIACODEC_DECODER
-static int hevc_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
+static int hevc_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format,
+                               MediaCodecNativeDvDiag *diag)
 {
     int i;
     int ret;
+    MediaCodecH264DecContext *s = avctx->priv_data;
 
     HEVCParamSets ps;
     HEVCSEI sei;
@@ -223,8 +269,12 @@ static int hevc_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
     memset(&sei, 0, sizeof(sei));
 
     ret = ff_hevc_decode_extradata(avctx->extradata, avctx->extradata_size,
-                                   &ps, &sei, &is_nalff, &nal_length_size, 0, 1, avctx);
+                                   &ps, &sei, &is_nalff, &nal_length_size,
+                                   s->native_dv ? AV_EF_EXPLODE : 0, 1, avctx);
     if (ret < 0) {
+        if (s->native_dv)
+            av_log(avctx, AV_LOG_ERROR,
+                   "native_dv initialization parameter sets could not be parsed\n");
         goto done;
     }
 
@@ -245,6 +295,28 @@ static int hevc_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
     if (pps) {
         if (ps.sps_list[pps->sps_id]) {
             sps = ps.sps_list[pps->sps_id];
+        }
+    }
+
+    if (s->native_dv) {
+        /* A fresh native DV codec must receive real initialization sets. Use
+         * the parsed references, not hvcC array counts or an unrelated VPS. */
+        vps = NULL;
+        pps = NULL;
+        sps = NULL;
+        for (i = 0; i < HEVC_MAX_PPS_COUNT; i++) {
+            const HEVCPPS *candidate = ps.pps_list[i];
+            const HEVCSPS *candidate_sps;
+            if (!candidate || candidate->sps_id >= HEVC_MAX_SPS_COUNT)
+                continue;
+            candidate_sps = ps.sps_list[candidate->sps_id];
+            if (!candidate_sps || candidate_sps->vps_id >= HEVC_MAX_VPS_COUNT ||
+                !ps.vps_list[candidate_sps->vps_id])
+                continue;
+            pps = candidate;
+            sps = candidate_sps;
+            vps = ps.vps_list[sps->vps_id];
+            break;
         }
     }
 
@@ -273,13 +345,23 @@ static int hevc_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
         memcpy(data + vps_data_size + sps_data_size, pps_data, pps_data_size);
 
         ff_AMediaFormat_setBuffer(format, "csd-0", data, data_size);
+        ff_mediacodec_diag_blob(avctx, diag, "csd_submitted", data, data_size);
 
         av_freep(&data);
     } else {
         const int warn = is_nalff && avctx->codec_tag == MKTAG('h','v','c','1');
+        ff_mediacodec_diag_log(avctx, diag,
+               "native_dv_diag decoder=%"PRIu64" epoch=%d event=csd_not_submitted reason=params_missing\n",
+               diag->decoder_id, diag->epoch);
         av_log(avctx, warn ? AV_LOG_WARNING : AV_LOG_DEBUG,
                "Could not extract VPS/PPS/SPS from extradata\n");
-        ret = 0;
+        if (s->native_dv) {
+            av_log(avctx, AV_LOG_ERROR,
+                   "native_dv requires a parsed PPS/SPS/VPS reference chain before codec start\n");
+            ret = AVERROR_INVALIDDATA;
+        } else {
+            ret = 0;
+        }
     }
 
 done:
@@ -314,6 +396,36 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
 }
 #endif
 
+/* Experimental opt-in route: preserve HEVC CSD, access units and RPUs. */
+static int mediacodec_validate_native_dv(AVCodecContext *avctx)
+{
+    const AVPacketSideData *sd;
+    const AVDOVIDecoderConfigurationRecord *dovi;
+
+    if (avctx->codec_id != AV_CODEC_ID_HEVC) {
+        av_log(avctx, AV_LOG_ERROR, "native_dv requires an HEVC decoder\n");
+        return AVERROR(EINVAL);
+    }
+
+    sd = ff_get_coded_side_data(avctx, AV_PKT_DATA_DOVI_CONF);
+    if (!sd || !sd->data || sd->size < sizeof(*dovi)) {
+        av_log(avctx, AV_LOG_ERROR, "native_dv requires a valid DOVI configuration record\n");
+        return AVERROR_INVALIDDATA;
+    }
+    dovi = (const AVDOVIDecoderConfigurationRecord *)sd->data;
+    if (dovi->dv_profile != 5 || dovi->rpu_present_flag != 1 ||
+        dovi->bl_present_flag != 1 || dovi->el_present_flag != 0) {
+        av_log(avctx, AV_LOG_ERROR,
+               "native_dv requires single-layer P5 with BL/RPU and no EL "
+               "(profile=%u, BL=%u, RPU=%u, EL=%u)\n",
+               dovi->dv_profile, dovi->bl_present_flag,
+               dovi->rpu_present_flag, dovi->el_present_flag);
+        return AVERROR_INVALIDDATA;
+    }
+
+    return 0;
+}
+
 static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
 {
     int ret;
@@ -322,7 +434,37 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
     const char *codec_mime = NULL;
 
     FFAMediaFormat *format = NULL;
+    MediaCodecNativeDvDiag diag = { 0 };
     MediaCodecH264DecContext *s = avctx->priv_data;
+
+    /* READONLY AVOptions are skipped by av_opt_set_defaults(). The static
+     * schema default is queryable before open; initialize its runtime value. */
+    s->native_dv_api_version = 1;
+    mediacodec_clear_runtime_facts(s);
+
+    ff_mediacodec_diag_begin(avctx, &diag, s->native_dv && s->native_dv_diag);
+    if (diag.enabled) {
+        const AVPacketSideData *sd = av_packet_side_data_get(avctx->coded_side_data,
+                                                            avctx->nb_coded_side_data,
+                                                            AV_PKT_DATA_DOVI_CONF);
+        const uint8_t *conf = sd ? sd->data : NULL;
+        size_t conf_size = sd ? sd->size : 0;
+        ff_mediacodec_diag_blob(avctx, &diag, "extradata", avctx->extradata,
+                                avctx->extradata_size > 0 ? avctx->extradata_size : 0);
+        ff_mediacodec_diag_blob(avctx, &diag, "dovi_conf", conf, conf_size);
+        if (diag.enabled && conf_size >= sizeof(AVDOVIDecoderConfigurationRecord)) {
+            const AVDOVIDecoderConfigurationRecord *d = (const void *)conf;
+            ff_mediacodec_diag_log(avctx, &diag,
+                   "native_dv_diag decoder=%"PRIu64" event=dovi_fields profile=%d level=%d bl=%d el=%d rpu=%d compatibility=%d\n",
+                   diag.decoder_id, d->dv_profile, d->dv_level, d->bl_present_flag,
+                   d->el_present_flag, d->rpu_present_flag, d->dv_bl_signal_compatibility_id);
+        }
+    }
+    if (s->native_dv) {
+        ret = mediacodec_validate_native_dv(avctx);
+        if (ret < 0)
+            goto done;
+    }
 
     ret = ff_mediacodec_dovi_alloc(avctx, &s->dovi_export, s->dovi);
     if (ret < 0)
@@ -359,9 +501,16 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
 #endif
 #if CONFIG_HEVC_MEDIACODEC_DECODER
     case AV_CODEC_ID_HEVC:
-        codec_mime = "video/hevc";
+        codec_mime = s->native_dv ? "video/dolby-vision" : "video/hevc";
+        if (s->native_dv) {
+            /* Android DolbyVisionProfileDvheStn (P5), not HEVC Main10. */
+            ff_AMediaFormat_setInt32(format, "profile", 0x20);
+            av_log(avctx, AV_LOG_INFO,
+                   "native_dv requested: MIME=%s, Android profile=0x20; "
+                   "preserving HEVC CSD, access units and RPU\n", codec_mime);
+        }
 
-        ret = hevc_set_extradata(avctx, format);
+        ret = hevc_set_extradata(avctx, format, &diag);
         if (ret < 0)
             goto done;
         break;
@@ -459,12 +608,22 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
         goto done;
     }
 
+    if (diag.requested) {
+        s->ctx->native_dv_diag = diag;
+        diag.requested = diag.enabled = 0; /* common independently owns the evidence */
+    }
     s->ctx->delay_flush = s->delay_flush;
     s->ctx->use_ndk_codec = s->use_ndk_codec;
 
     if ((ret = ff_mediacodec_dec_init(avctx, s->ctx, codec_mime, format)) < 0) {
         s->ctx = NULL;
         goto done;
+    }
+
+    if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+        ret = mediacodec_publish_runtime_facts(avctx, codec_mime);
+        if (ret < 0)
+            goto done;
     }
 
     av_log(avctx, AV_LOG_INFO,
@@ -491,6 +650,12 @@ done:
     }
 
     if (ret < 0) {
+        if (diag.requested) {
+            av_log(avctx, AV_LOG_INFO,
+                   "native_dv_diag decoder=%"PRIu64" event=init_failed status=%d\n",
+                   diag.decoder_id, ret);
+            ff_mediacodec_diag_close(avctx, &diag);
+        }
         mediacodec_decode_close(avctx);
     }
 
@@ -511,7 +676,7 @@ static int mediacodec_receive_frame_internal(AVCodecContext *avctx,
     return ret;
 }
 
-static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+static int mediacodec_receive_frame_impl(AVCodecContext *avctx, AVFrame *frame)
 {
     MediaCodecH264DecContext *s = avctx->priv_data;
     int ret;
@@ -521,6 +686,8 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
        all retained frames. */
     if (s->delay_flush && ff_mediacodec_dec_is_flushing(avctx, s->ctx)) {
         int flush_ret = ff_mediacodec_dec_flush(avctx, s->ctx);
+        if (flush_ret < 0)
+            return flush_ret;
         if (!flush_ret) {
             return AVERROR(EAGAIN);
         }
@@ -592,6 +759,7 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
         } else if (ret < 0) {
             return ret;
         }
+        ff_mediacodec_diag_au(avctx, &s->ctx->native_dv_diag, &s->buffered_pkt);
         /* Register the RPU before queueing: a split AU can produce output
          * early. */
         ff_mediacodec_dovi_track_input(avctx, s->dovi_export, &s->buffered_pkt,
@@ -602,14 +770,28 @@ static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
     return AVERROR(EAGAIN);
 }
 
+static int mediacodec_receive_frame(AVCodecContext *avctx, AVFrame *frame)
+{
+    MediaCodecH264DecContext *s = avctx->priv_data;
+    int ret = mediacodec_receive_frame_impl(avctx, frame);
+
+    if (ret < 0 && ret != AVERROR(EAGAIN) && ret != AVERROR_EOF)
+        mediacodec_clear_runtime_facts(s);
+    return ret;
+}
+
 static void mediacodec_decode_flush(AVCodecContext *avctx)
 {
     MediaCodecH264DecContext *s = avctx->priv_data;
+    int ret;
 
     av_packet_unref(&s->buffered_pkt);
 
-    if (ff_mediacodec_dec_flush(avctx, s->ctx) == 1)
+    ret = ff_mediacodec_dec_flush(avctx, s->ctx);
+    if (ret == 1)
         ff_mediacodec_dovi_flush(avctx, s->dovi_export);
+    else if (ret < 0)
+        mediacodec_clear_runtime_facts(s);
 }
 
 static const AVCodecHWConfigInternal *const mediacodec_hw_configs[] = {
@@ -627,7 +809,20 @@ static const AVCodecHWConfigInternal *const mediacodec_hw_configs[] = {
 
 #define OFFSET(x) offsetof(MediaCodecH264DecContext, x)
 #define VD AV_OPT_FLAG_VIDEO_PARAM | AV_OPT_FLAG_DECODING_PARAM
+#define VDX (VD | AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY)
 static const AVOption ff_mediacodec_vdec_options[] = {
+    { "native_dv_api_version", "Native Dolby Vision runtime-fact schema version (static default queryable before codec open)",
+                              OFFSET(native_dv_api_version), AV_OPT_TYPE_INT, {.i64 = 1}, 1, 1, VDX },
+    { "mediacodec_mime", "Configured MediaCodec MIME after successful configure/start",
+                         OFFSET(mediacodec_mime), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, VDX },
+    { "mediacodec_name", "Selected MediaCodec name after successful configure/start (empty if unknown)",
+                         OFFSET(mediacodec_name), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, VDX },
+    { "native_dv_active", "Native P5 Surface codec configured and started; does not prove visible frames or HDR display",
+                          OFFSET(native_dv_active), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, VDX },
+    { "native_dv_diag", "Bounded native DV input evidence (requires native_dv=1)",
+                        OFFSET(native_dv_diag), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
+    { "native_dv", "Experimentally decode single-layer Dolby Vision P5 to a Surface (HEVC only)",
+                   OFFSET(native_dv), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
     { "delay_flush", "Delay flush until hw output buffers are returned to the decoder",
                      OFFSET(delay_flush), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
     { "ndk_codec", "Use MediaCodec from NDK",
