@@ -2,6 +2,8 @@ Entries are sorted chronologically from oldest to youngest within each release,
 releases are sorted from youngest to oldest.
 
 version 7.1.3:
+ avformat: add avformat_complete_initial_dovi_hvcc() to complete missing initial MOV Dolby Vision P5 hvcC parameter sets
+ avcodec/mediacodecdec: add native_dv and native_dv_diag options for experimental single-layer Dolby Vision P5 Surface decoding
  avutil/common: cast GET_BYTE/GET_16BIT returned value
  avfilter/vf_drawtext: fix call GET_UTF8 with invalid argument
  avfilter/vf_drawtext: fix incorrect text length
