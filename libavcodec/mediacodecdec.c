@@ -396,6 +396,34 @@ static int common_set_extradata(AVCodecContext *avctx, FFAMediaFormat *format)
 }
 #endif
 
+/* Whether the single-layer native-DV route accepts this configuration:
+ * BL+RPU and no EL with profile 5 or profile 8 (the RPU stays in the
+ * elementary stream for the Dolby Vision decoder). */
+static int native_dv_accepts(const AVDOVIDecoderConfigurationRecord *dovi)
+{
+    return dovi->rpu_present_flag == 1 && dovi->bl_present_flag == 1 &&
+           dovi->el_present_flag == 0 &&
+           (dovi->dv_profile == 5 || dovi->dv_profile == 8);
+}
+
+/* Android CodecProfileLevel key to signal in the MediaFormat. P5 maps to
+ * DolbyVisionProfileDvheStn (0x20), which the API 24 LG decoder declares
+ * and which is verified on-device. P8 signals DolbyVisionProfileDvheSt in
+ * its modern-SDK value (0x100): on the API 24 LG device every P8 signaling
+ * is refused (keyless/0x2/0x100 fail configure; 0x20 passes but the decoded
+ * buffers never reach the Surface), so P8 keeps the fail-fast 0x100, which
+ * is also forward-correct on API 27+. Codec lookup for non-0x20 keys stays
+ * MIME-only (see mediacodecdec_common.c) because declared capabilities
+ * omit them. */
+static int native_dv_android_profile_key(const AVDOVIDecoderConfigurationRecord *dovi)
+{
+    if (dovi->dv_profile == 5)
+        return 0x20;
+    if (dovi->dv_profile == 8)
+        return 0x100;
+    return 0;
+}
+
 /* Experimental opt-in route: preserve HEVC CSD, access units and RPUs. */
 static int mediacodec_validate_native_dv(AVCodecContext *avctx)
 {
@@ -413,10 +441,9 @@ static int mediacodec_validate_native_dv(AVCodecContext *avctx)
         return AVERROR_INVALIDDATA;
     }
     dovi = (const AVDOVIDecoderConfigurationRecord *)sd->data;
-    if (dovi->dv_profile != 5 || dovi->rpu_present_flag != 1 ||
-        dovi->bl_present_flag != 1 || dovi->el_present_flag != 0) {
+    if (!native_dv_accepts(dovi)) {
         av_log(avctx, AV_LOG_ERROR,
-               "native_dv requires single-layer P5 with BL/RPU and no EL "
+               "native_dv requires single-layer P5 or P8 with BL/RPU and no EL "
                "(profile=%u, BL=%u, RPU=%u, EL=%u)\n",
                dovi->dv_profile, dovi->bl_present_flag,
                dovi->rpu_present_flag, dovi->el_present_flag);
@@ -503,11 +530,23 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
     case AV_CODEC_ID_HEVC:
         codec_mime = s->native_dv ? "video/dolby-vision" : "video/hevc";
         if (s->native_dv) {
-            /* Android DolbyVisionProfileDvheStn (P5), not HEVC Main10. */
-            ff_AMediaFormat_setInt32(format, "profile", 0x20);
+            const AVPacketSideData *sd_dovi =
+                ff_get_coded_side_data(avctx, AV_PKT_DATA_DOVI_CONF);
+            /* mediacodec_validate_native_dv() has already accepted the
+             * configuration, so the record is present and the key is 0x20
+             * (P5) or 0x100 (P8; see native_dv_android_profile_key). */
+            const int profile_key =
+                sd_dovi && sd_dovi->data
+                    ? native_dv_android_profile_key(
+                          (const AVDOVIDecoderConfigurationRecord *)sd_dovi->data)
+                    : 0;
+            if (profile_key)
+                ff_AMediaFormat_setInt32(format, "profile", profile_key);
             av_log(avctx, AV_LOG_INFO,
-                   "native_dv requested: MIME=%s, Android profile=0x20; "
-                   "preserving HEVC CSD, access units and RPU\n", codec_mime);
+                   "native_dv requested: MIME=%s, Android profile key=0x%x%s; "
+                   "preserving HEVC CSD, access units and RPU\n",
+                   codec_mime, profile_key,
+                   profile_key ? "" : " (omitted)");
         }
 
         ret = hevc_set_extradata(avctx, format, &diag);
@@ -817,11 +856,11 @@ static const AVOption ff_mediacodec_vdec_options[] = {
                          OFFSET(mediacodec_mime), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, VDX },
     { "mediacodec_name", "Selected MediaCodec name after successful configure/start (empty if unknown)",
                          OFFSET(mediacodec_name), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, VDX },
-    { "native_dv_active", "Native P5 Surface codec configured and started; does not prove visible frames or HDR display",
+    { "native_dv_active", "Native P5/P8 Surface codec configured and started; does not prove visible frames or HDR display",
                           OFFSET(native_dv_active), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 1, VDX },
     { "native_dv_diag", "Bounded native DV input evidence (requires native_dv=1)",
                         OFFSET(native_dv_diag), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
-    { "native_dv", "Experimentally decode single-layer Dolby Vision P5 to a Surface (HEVC only)",
+    { "native_dv", "Experimentally decode single-layer Dolby Vision P5/P8 to a Surface (HEVC only)",
                    OFFSET(native_dv), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },
     { "delay_flush", "Delay flush until hw output buffers are returned to the decoder",
                      OFFSET(delay_flush), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, VD },

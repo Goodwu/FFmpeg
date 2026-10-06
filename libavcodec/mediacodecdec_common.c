@@ -1048,21 +1048,41 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
     }
 
     if (native_dv) {
-        int32_t format_profile;
+        int32_t format_profile = 0;
 
         if (!s->surface) {
             av_log(avctx, AV_LOG_ERROR, "native_dv requires Surface output; copy decoding is unsupported\n");
             return AVERROR(EINVAL);
         }
-        if (avctx->codec_id != AV_CODEC_ID_HEVC ||
-            !ff_AMediaFormat_getInt32(format, "profile", &format_profile) ||
-            format_profile != 0x20) {
-            av_log(avctx, AV_LOG_ERROR, "native_dv requires explicit Android P5 profile 0x20\n");
+        if (avctx->codec_id != AV_CODEC_ID_HEVC) {
+            av_log(avctx, AV_LOG_ERROR, "native_dv requires an HEVC decoder\n");
+            return AVERROR(EINVAL);
+        }
+        if (ff_AMediaFormat_getInt32(format, "profile", &format_profile) &&
+            format_profile != 0x20 && format_profile != 0x2 &&
+            format_profile != 0x100) {
+            av_log(avctx, AV_LOG_ERROR, "native_dv received an unexpected Android profile 0x%x\n",
+                   format_profile);
             return AVERROR_INVALIDDATA;
         }
-        profile = format_profile;
-        av_log(avctx, AV_LOG_INFO,
-               "native_dv selecting Surface decoder: MIME=%s, profile=0x%x\n", mime, profile);
+        if (format_profile == 0x20) {
+            /* P5: explicit DolbyVisionProfileDvheStn, matching the declared
+             * decoder capability. */
+            profile = format_profile;
+            av_log(avctx, AV_LOG_INFO,
+                   "native_dv selecting Surface decoder: MIME=%s, profile=0x%x\n", mime, profile);
+        } else {
+            /* P8: configure with the modern-SDK DvheSt key (0x100). On the
+             * API 24 test device this is refused at configure (fail-fast);
+             * accepted signaling (0x20) stalls presentation instead. The
+             * lookup stays MIME-only (profile < 0) because declared
+             * capabilities omit P8 keys; 0x2 is retained in the whitelist
+             * only as the API 24-era experimental value. */
+            profile = -1;
+            av_log(avctx, AV_LOG_INFO,
+                   "native_dv selecting Surface decoder: MIME=%s, configure profile=0x%x (MIME-only lookup)\n",
+                   mime, format_profile);
+        }
     } else {
         profile = ff_AMediaCodecProfile_getProfileFromAVCodecContext(avctx);
         if (profile < 0)
