@@ -28,6 +28,7 @@
 #include "libavutil/common.h"
 #include "libavutil/hwcontext_mediacodec.h"
 #include "libavutil/mem.h"
+#include "libavutil/pixdesc.h"
 #include "libavutil/sha.h"
 #include "libavutil/log.h"
 #include "libavutil/pixfmt.h"
@@ -37,6 +38,7 @@
 
 #include "avcodec.h"
 #include "decode.h"
+#include "hevc/hevc.h"
 
 #include "mediacodec.h"
 #include "mediacodec_surface.h"
@@ -1148,6 +1150,509 @@ static int mediacodec_dec_get_audio_codec(AVCodecContext *avctx, MediaCodecDecCo
     return 0;
 }
 
+/*
+ * HEVC SPS VUI color-descriptor probe.
+ *
+ * MediaCodec does not parse the bitstream VUI, and when the container color
+ * metadata never reaches avctx (avctx trc/primaries UNSPECIFIED) hardware
+ * frames come back as SDR/bt.1886 for pure HDR HEVC streams. As a fallback,
+ * parse the SPS -> VUI colour description directly from extradata so the
+ * color keys further down in ff_mediacodec_dec_init can be populated.
+ *
+ * The block below (MKSVUIGetBits .. mcdec_probe_hevc_vui_color) is
+ * self-contained: it does not use any Android or FFmpeg API beyond the
+ * avctx fields, so it can be extracted verbatim for host-side testing.
+ */
+
+typedef struct MKSVUIGetBits {
+    const uint8_t *buf;
+    int size_bits;
+    int index;
+    int error;
+} MKSVUIGetBits;
+
+/* Bit reader with a sticky overread flag: once error is set, every read
+ * returns 0 and every parse ends in failure. Never reads out of bounds. */
+static int mkvui_get_bits(MKSVUIGetBits *gb, int n)
+{
+    uint32_t value = 0;
+
+    if (gb->error || n < 1 || n > 32 || n > gb->size_bits - gb->index) {
+        gb->error = 1;
+        return 0;
+    }
+    while (n > 0) {
+        int take = FFMIN(8 - (gb->index & 7), n);
+        int shift = 8 - (gb->index & 7) - take;
+
+        value = (value << take) |
+                ((gb->buf[gb->index >> 3] >> shift) & ((1 << take) - 1));
+        gb->index += take;
+        n -= take;
+    }
+    return (int)value;
+}
+
+static void mkvui_skip_bits(MKSVUIGetBits *gb, int n)
+{
+    while (n > 0 && !gb->error) {
+        int take = FFMIN(n, 32);
+
+        mkvui_get_bits(gb, take);
+        n -= take;
+    }
+}
+
+static int mkvui_get_ue(MKSVUIGetBits *gb)
+{
+    int zeros = 0;
+
+    while (!gb->error && mkvui_get_bits(gb, 1) == 0) {
+        if (++zeros > 30) {
+            gb->error = 1;
+            return 0;
+        }
+    }
+    if (gb->error)
+        return 0;
+    if (zeros == 0)
+        return 0;
+    return (1 << zeros) - 1 + mkvui_get_bits(gb, zeros);
+}
+
+static int mkvui_get_se(MKSVUIGetBits *gb)
+{
+    int k = mkvui_get_ue(gb);
+
+    if (gb->error)
+        return 0;
+    /* 0 -> 0, odd -> (k+1)/2, even -> -k/2 */
+    return (k & 1) ? (k + 1) / 2 : -(k >> 1);
+}
+
+/* Remove emulation prevention bytes: 00 00 03 -> 00 00, mirroring
+ * ff_h2645_extract_rbsp(). Returns the RBSP length, < 0 on overflow. */
+static int mkvui_unescape(const uint8_t *src, int src_len,
+                          uint8_t *dst, int dst_size)
+{
+    int si = 0, di = 0;
+
+    while (si < src_len) {
+        if (si + 2 < src_len &&
+            src[si] == 0 && src[si + 1] == 0 && src[si + 2] == 3) {
+            if (di + 2 > dst_size)
+                return -1;
+            dst[di++] = 0;
+            dst[di++] = 0;
+            si += 3;
+            continue;
+        }
+        if (di + 1 > dst_size)
+            return -1;
+        dst[di++] = src[si++];
+    }
+    return di;
+}
+
+/* Consume one sub-layer's SchedSelEntry list (Annex E.2): cpb_cnt+1 times
+ * bit_rate/cpb_size (plus the du pair when sub-pic HRD is signalled) and a
+ * 1-bit cbr_flag each. Called once per present HRD type: the NAL and the
+ * VCL lists are separate syntax repetitions, not a single shared one. */
+static void mkvui_cpb_entries(MKSVUIGetBits *gb, int sub_pic, int cpb_cnt)
+{
+    for (int c = 0; c <= cpb_cnt; c++) {
+        mkvui_get_ue(gb);    /* bit_rate_value_minus1 */
+        mkvui_get_ue(gb);    /* cpb_size_value_minus1 */
+        if (sub_pic) {
+            mkvui_get_ue(gb);  /* cpb_size_du_value_minus1 */
+            mkvui_get_ue(gb);  /* bit_rate_du_value_minus1 */
+        }
+        mkvui_get_bits(gb, 1);  /* cbr_flag */
+    }
+}
+
+/* Parse one SPS NAL (including the 2-byte NAL unit header) and extract the
+ * VUI colour description. Field order mirrors hevc/ps.c ff_hevc_parse_sps
+ * (and its short-term RPS / profile_tier_level helpers) bit for bit; values
+ * are consumed without being stored. Returns 0 and fills trc/prim/matrix
+ * when the VUI colour description was found and the bitstream stayed in
+ * bounds; < 0 on any parse failure. */
+static int mkvui_parse_sps_color(const uint8_t *nal, int nal_len,
+                                 int *trc, int *prim, int *matrix)
+{
+    uint8_t rbsp[1024];
+    MKSVUIGetBits gb;
+    int rbsp_len, i, j;
+    int max_sub_layers, log2_max_poc_lsb, nb_st_rps, prev_num_delta_pocs;
+
+    if (nal_len < 4) /* 2-byte NAL header + minimal payload */
+        return -1;
+    rbsp_len = mkvui_unescape(nal + 2, nal_len - 2, rbsp, sizeof(rbsp));
+    if (rbsp_len < 0)
+        return -1;
+
+    memset(&gb, 0, sizeof(gb));
+    gb.buf      = rbsp;
+    gb.size_bits = rbsp_len * 8;
+
+    mkvui_get_bits(&gb, 4);  /* sps_video_parameter_set_id */
+    max_sub_layers = mkvui_get_bits(&gb, 3) + 1;
+    mkvui_get_bits(&gb, 1);  /* temporal_id_nesting */
+    if (gb.error || max_sub_layers > HEVC_MAX_SUB_LAYERS)
+        return -1;
+
+    /* profile_tier_level(1, max_sub_layers): general part is a fixed
+     * 2+1+5 + 32 + 48 + 8 bits (the constraint flags block totals exactly
+     * 48 bits in every branch of decode_profile_tier_level). */
+    mkvui_skip_bits(&gb, 2 + 1 + 5 + 32 + 48);  /* profile_space..inbld */
+    mkvui_get_bits(&gb, 8);  /* general_level_idc */
+    if (max_sub_layers > 1) {
+        int sub_profile_present[HEVC_MAX_SUB_LAYERS] = { 0 };
+        int sub_level_present[HEVC_MAX_SUB_LAYERS]   = { 0 };
+
+        for (i = 0; i < max_sub_layers - 1; i++) {
+            sub_profile_present[i] = mkvui_get_bits(&gb, 1);
+            sub_level_present[i]   = mkvui_get_bits(&gb, 1);
+        }
+        for (i = max_sub_layers - 1; i < 8; i++)
+            mkvui_get_bits(&gb, 2);  /* reserved_zero_2bits */
+        for (i = 0; i < max_sub_layers - 1; i++) {
+            if (sub_profile_present[i])
+                mkvui_skip_bits(&gb, 88);  /* sub_layer profile_tier_level */
+            if (sub_level_present[i])
+                mkvui_get_bits(&gb, 8);    /* sub_layer_level_idc */
+        }
+    }
+    if (gb.error)
+        return -1;
+
+    mkvui_get_ue(&gb);  /* sps_seq_parameter_set_id */
+    if (mkvui_get_ue(&gb) == 3)  /* chroma_format_idc */
+        mkvui_get_bits(&gb, 1);  /* separate_colour_plane_flag */
+    mkvui_get_ue(&gb);  /* pic_width_in_luma_samples */
+    mkvui_get_ue(&gb);  /* pic_height_in_luma_samples */
+    if (mkvui_get_bits(&gb, 1)) {  /* conformance_window_flag */
+        for (i = 0; i < 4; i++)
+            mkvui_get_ue(&gb);
+    }
+    mkvui_get_ue(&gb);  /* bit_depth_luma_minus8 */
+    mkvui_get_ue(&gb);  /* bit_depth_chroma_minus8 */
+    log2_max_poc_lsb = mkvui_get_ue(&gb) + 4;
+    if (gb.error || log2_max_poc_lsb > 16)
+        return -1;
+
+    if (mkvui_get_bits(&gb, 1)) {  /* sps_sub_layer_ordering_info_present */
+        for (i = 0; i < max_sub_layers; i++) {
+            mkvui_get_ue(&gb);
+            mkvui_get_ue(&gb);
+            mkvui_get_ue(&gb);
+        }
+    } else {
+        for (i = max_sub_layers - 1; i < max_sub_layers; i++) {
+            mkvui_get_ue(&gb);
+            mkvui_get_ue(&gb);
+            mkvui_get_ue(&gb);
+        }
+    }
+    for (i = 0; i < 6; i++)  /* log2_min/max cb/tb sizes, transform depths */
+        mkvui_get_ue(&gb);
+
+    if (mkvui_get_bits(&gb, 1)) {  /* scaling_list_enabled */
+        if (mkvui_get_bits(&gb, 1)) {  /* scaling_list_data_present */
+            /* scaling_list_data(), mirror of hevc/ps.c: consume only. */
+            for (i = 0; i < 4; i++) {  /* size_id */
+                for (j = 0; j < 6; j += (i == 3) ? 3 : 1) {  /* matrix_id */
+                    if (mkvui_get_bits(&gb, 1)) {  /* pred_mode */
+                        int coef_num = (i == 0) ? 16 : 64;
+
+                        if (i > 1)
+                            mkvui_get_se(&gb);  /* dc coefficient */
+                        while (coef_num--)
+                            mkvui_get_se(&gb);
+                    } else {
+                        mkvui_get_ue(&gb);  /* delta from previous matrix */
+                    }
+                }
+            }
+        }
+    }
+
+    mkvui_get_bits(&gb, 1);  /* amp_enabled */
+    mkvui_get_bits(&gb, 1);  /* sample_adaptive_offset_enabled */
+
+    if (mkvui_get_bits(&gb, 1)) {  /* pcm_enabled */
+        mkvui_get_bits(&gb, 4);  /* pcm_sample_bit_depth_luma_minus1 */
+        mkvui_get_bits(&gb, 4);  /* pcm_sample_bit_depth_chroma_minus1 */
+        mkvui_get_ue(&gb);       /* log2_min_pcm_luma_coding_block_size_minus3 */
+        mkvui_get_ue(&gb);       /* log2_diff_max_min_pcm_luma_... */
+        mkvui_get_bits(&gb, 1);  /* pcm_loop_filter_disabled */
+    }
+
+    nb_st_rps = mkvui_get_ue(&gb);
+    if (gb.error || nb_st_rps > HEVC_MAX_SHORT_TERM_REF_PIC_SETS)
+        return -1;
+
+    /* short_term_ref_pic_sets, mirror of ff_hevc_decode_short_term_rps()
+     * in the SPS context (is_slice_header == 0): only the previous RPS
+     * can be a predictor and only its num_delta_pocs is needed to walk
+     * the syntax. */
+    prev_num_delta_pocs = 0;
+    for (i = 0; i < nb_st_rps; i++) {
+        int num_delta_pocs = 0;
+
+        if (i > 0 && mkvui_get_bits(&gb, 1)) { /* inter_ref_pic_set_prediction */
+            int abs_delta_rps;
+            int k = 0;
+            uint8_t used[32] = { 0 };
+
+            mkvui_get_bits(&gb, 1); /* delta_rps_sign, consumed only */
+            abs_delta_rps = mkvui_get_ue(&gb) + 1;
+            if (gb.error || abs_delta_rps > 32768)
+                return -1;
+            for (j = 0; j <= prev_num_delta_pocs; j++) {
+                int use_delta;
+
+                used[k] = mkvui_get_bits(&gb, 1);
+                use_delta = used[k] ? 0 : mkvui_get_bits(&gb, 1);
+                if (used[k] || use_delta)
+                    k++;
+            }
+            if (gb.error || k >= (int)FF_ARRAY_ELEMS(used))
+                return -1;
+            num_delta_pocs = k;
+        } else {
+            int num_negative_pics = mkvui_get_ue(&gb);
+            int num_positive_pics = mkvui_get_ue(&gb);
+
+            if (gb.error || num_negative_pics >= HEVC_MAX_REFS ||
+                num_positive_pics >= HEVC_MAX_REFS)
+                return -1;
+            /* 7.3.7: each delta_poc is followed by a 1-bit
+             * used_by_curr_pic_s0/s1_flag; skipping them would desync
+             * every later field (mirrors ps.c st_rps used-flag reads). */
+            for (j = 0; j < num_negative_pics; j++) {
+                if (mkvui_get_ue(&gb) >= 32768)  /* delta_poc_s0_minus1 */
+                    return -1;
+                mkvui_get_bits(&gb, 1);  /* used_by_curr_pic_s0_flag */
+            }
+            for (j = 0; j < num_positive_pics; j++) {
+                if (mkvui_get_ue(&gb) >= 32768)  /* delta_poc_s1_minus1 */
+                    return -1;
+                mkvui_get_bits(&gb, 1);  /* used_by_curr_pic_s1_flag */
+            }
+            if (gb.error)
+                return -1;
+            num_delta_pocs = num_negative_pics + num_positive_pics;
+        }
+        prev_num_delta_pocs = num_delta_pocs;
+    }
+
+    if (mkvui_get_bits(&gb, 1)) {  /* long_term_ref_pics_present */
+        int num_long_term = mkvui_get_ue(&gb);
+
+        if (gb.error || num_long_term > HEVC_MAX_LONG_TERM_REF_PICS)
+            return -1;
+        for (i = 0; i < num_long_term; i++) {
+            mkvui_get_bits(&gb, log2_max_poc_lsb);  /* lt_ref_pic_poc_lsb_sps */
+            mkvui_get_bits(&gb, 1);  /* used_by_curr_pic_lt_flag */
+        }
+    }
+
+    mkvui_get_bits(&gb, 1);  /* sps_temporal_mvp_enabled */
+    mkvui_get_bits(&gb, 1);  /* strong_intra_smoothing_enabled */
+
+    if (!mkvui_get_bits(&gb, 1))  /* vui_parameters_present */
+        return -1;
+
+    /* vui_parameters(), field order mirrors ff_h2645_decode_common_vui_params
+     * and decode_vui(). The alternate-syntax workarounds of decode_vui are
+     * intentionally not reproduced: this probe only needs well-formed VUI. */
+    if (mkvui_get_bits(&gb, 1)) {  /* aspect_ratio_info_present */
+        if (mkvui_get_bits(&gb, 8) == 255) {  /* aspect_ratio_idc == EXTENDED_SAR */
+            mkvui_get_bits(&gb, 16);
+            mkvui_get_bits(&gb, 16);
+        }
+    }
+    if (mkvui_get_bits(&gb, 1))  /* overscan_info_present */
+        mkvui_get_bits(&gb, 1);  /* overscan_appropriate */
+
+    if (mkvui_get_bits(&gb, 1)) {  /* video_signal_type_present */
+        mkvui_get_bits(&gb, 3);  /* video_format */
+        mkvui_get_bits(&gb, 1);  /* video_full_range */
+        if (mkvui_get_bits(&gb, 1)) {  /* colour_description_present */
+            *prim   = mkvui_get_bits(&gb, 8);  /* colour_primaries */
+            *trc    = mkvui_get_bits(&gb, 8);  /* transfer_characteristics */
+            *matrix = mkvui_get_bits(&gb, 8);  /* matrix_coeffs */
+        }
+    }
+
+    if (mkvui_get_bits(&gb, 1)) {  /* chroma_loc_info_present */
+        mkvui_get_ue(&gb);
+        mkvui_get_ue(&gb);
+    }
+    mkvui_get_bits(&gb, 1);  /* neutral_chroma_indication */
+    mkvui_get_bits(&gb, 1);  /* field_seq */
+    mkvui_get_bits(&gb, 1);  /* frame_field_info_present */
+    if (mkvui_get_bits(&gb, 1)) {  /* default_display_window */
+        for (i = 0; i < 4; i++)
+            mkvui_get_ue(&gb);
+    }
+
+    if (mkvui_get_bits(&gb, 1)) {  /* vui_timing_info_present */
+        mkvui_get_bits(&gb, 32);  /* num_units_in_tick */
+        mkvui_get_bits(&gb, 32);  /* time_scale */
+        if (mkvui_get_bits(&gb, 1))  /* poc_proportional_to_timing */
+            mkvui_get_ue(&gb);
+        if (mkvui_get_bits(&gb, 1)) {  /* vui_hrd_parameters_present */
+            /* HRD syntax consumed without storage, mirroring
+             * hevc/ps.c decode_hrd(gb, 1, ...) + decode_sublayer_hrd(). */
+            int nal_hrd, vcl_hrd, sub_pic = 0;
+            int cpb_cnts[HEVC_MAX_SUB_LAYERS] = { 0 };
+            int sl;
+
+            nal_hrd = mkvui_get_bits(&gb, 1);
+            vcl_hrd = mkvui_get_bits(&gb, 1);
+            if (nal_hrd || vcl_hrd) {
+                sub_pic = mkvui_get_bits(&gb, 1);
+                if (sub_pic) {
+                    mkvui_get_bits(&gb, 8);   /* tick_divisor_minus2 */
+                    mkvui_get_bits(&gb, 5);   /* du_cpb_removal_delay... */
+                    mkvui_get_bits(&gb, 1);   /* sub_pic_cpb_params... */
+                    mkvui_get_bits(&gb, 5);   /* dpb_output_delay_du... */
+                }
+                mkvui_get_bits(&gb, 4);       /* bit_rate_scale */
+                mkvui_get_bits(&gb, 4);       /* cpb_size_scale */
+                if (sub_pic)
+                    mkvui_get_bits(&gb, 4);   /* cpb_size_du_scale */
+                mkvui_get_bits(&gb, 5);       /* initial_cpb_removal... */
+                mkvui_get_bits(&gb, 5);       /* au_cpb_removal_delay... */
+                mkvui_get_bits(&gb, 5);       /* dpb_output_delay... */
+            }
+            for (sl = 0; sl < max_sub_layers; sl++) {
+                int fixed = mkvui_get_bits(&gb, 1);
+                int within = fixed ? 0 : mkvui_get_bits(&gb, 1);
+                int low_delay = 0;
+
+                if (within || fixed)
+                    mkvui_get_ue(&gb);        /* elemental_duration_in_tc */
+                else
+                    low_delay = mkvui_get_bits(&gb, 1);
+                if (!low_delay) {
+                    cpb_cnts[sl] = mkvui_get_ue(&gb);
+                    if (gb.error || cpb_cnts[sl] > 31)
+                        return -1;
+                }
+                if (gb.error)
+                    return -1;
+                if (nal_hrd)
+                    mkvui_cpb_entries(&gb, sub_pic, cpb_cnts[sl]);
+                if (vcl_hrd)
+                    mkvui_cpb_entries(&gb, sub_pic, cpb_cnts[sl]);
+            }
+        }
+    }
+
+    if (mkvui_get_bits(&gb, 1)) {  /* bitstream_restriction */
+        mkvui_get_bits(&gb, 1);  /* tiles_fixed_structure */
+        mkvui_get_bits(&gb, 1);  /* motion_vectors_over_pic_boundaries */
+        mkvui_get_bits(&gb, 1);  /* restricted_ref_pic_lists */
+        for (i = 0; i < 5; i++)
+            mkvui_get_ue(&gb);
+    }
+
+    return gb.error ? -1 : 0;
+}
+
+/* Walk every NAL unit in extradata (hvcC or Annex-B layout) and return the
+ * colour description of the first SPS whose VUI parses cleanly. */
+static int mkvui_probe_hevc_extradata(const uint8_t *data, int size,
+                                      int *trc, int *prim, int *matrix)
+{
+    if (size >= 24 && data[0] == 1) {
+        /* hvcC (ISO 14496-15): 22-byte header, numOfArrays at offset 22,
+         * each array: 1-byte flags+type, u16 numNalus, per NAL u16 length
+         * + data. The NAL payloads here are raw (pre-Annex-B) units. */
+        int num_arrays = data[22];
+        int pos = 23;
+        int a, n;
+
+        for (a = 0; a < num_arrays && pos + 3 <= size; a++) {
+            int nal_type   = data[pos] & 0x3f;
+            int num_nalus  = (data[pos + 1] << 8) | data[pos + 2];
+
+            pos += 3;
+            for (n = 0; n < num_nalus && pos + 2 <= size; n++) {
+                int nal_len = (data[pos] << 8) | data[pos + 1];
+
+                pos += 2;
+                if (pos + nal_len > size)
+                    return -1;
+                if (nal_type == 33 &&
+                    mkvui_parse_sps_color(data + pos, nal_len,
+                                          trc, prim, matrix) == 0)
+                    return 0;
+                pos += nal_len;
+            }
+        }
+        return -1;
+    }
+
+    /* Annex-B: scan all start codes (00 00 01; a 00 00 00 01 prefix simply
+     * leaves one extra zero byte that gets stripped below). */
+    {
+        int i = 0;
+
+        while (i + 2 < size) {
+            if (!data[i] && !data[i + 1] && data[i + 2] == 1) {
+                int nal_start = i + 3;
+                int nal_end   = size;
+                int j;
+
+                for (j = nal_start; j + 2 < size; j++) {
+                    if (!data[j] && !data[j + 1] && data[j + 2] == 1) {
+                        nal_end = j;
+                        break;
+                    }
+                }
+                while (nal_end > nal_start && data[nal_end - 1] == 0)
+                    nal_end--;  /* zeros belong to the next start code */
+                if (nal_end - nal_start >= 4 &&
+                    ((data[nal_start] >> 1) & 0x3f) == 33 &&
+                    mkvui_parse_sps_color(data + nal_start,
+                                          nal_end - nal_start,
+                                          trc, prim, matrix) == 0)
+                    return 0;
+                i = nal_end;
+            } else {
+                i++;
+            }
+        }
+    }
+    return -1;
+}
+
+/* Returns 0 when trc/prim/matrix were recovered from the extradata VUI and
+ * all three are valid, non-unspecified values; < 0 otherwise. */
+static int mcdec_probe_hevc_vui_color(AVCodecContext *avctx,
+                                      int *trc, int *prim, int *matrix)
+{
+    int t = -1, p = -1, m = -1;
+
+    if (!avctx->extradata || avctx->extradata_size <= 0)
+        return AVERROR(EINVAL);
+    if (mkvui_probe_hevc_extradata(avctx->extradata, avctx->extradata_size,
+                                   &t, &p, &m) < 0)
+        return AVERROR_INVALIDDATA;
+    if (t == AVCOL_TRC_UNSPECIFIED || !av_color_transfer_name(t) ||
+        p == AVCOL_PRI_UNSPECIFIED || !av_color_primaries_name(p) ||
+        m == AVCOL_SPC_UNSPECIFIED || !av_color_space_name(m))
+        return AVERROR_INVALIDDATA;
+    *trc    = t;
+    *prim   = p;
+    *matrix = m;
+    return 0;
+}
+
 int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
                            const char *mime, FFAMediaFormat *format)
 {
@@ -1173,6 +1678,106 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
         ff_mediacodec_diag_log(avctx, &s->native_dv_diag,
                "native_dv_diag decoder=%"PRIu64" epoch=%d event=configure mime=%s profile=32 surface_present=%d\n",
                s->native_dv_diag.decoder_id, s->native_dv_diag.epoch, mime, !!s->surface);
+
+    /* MediaCodec does not parse the bitstream VUI itself: per the Android
+     * docs the app must set the color keys on the configure MediaFormat,
+     * otherwise the decoder will not echo color metadata back on output
+     * frames (container smpte2084/bt2020 streams decode as bt.1886/SDR on
+     * hwdec paths). Propagate the explicit values avctx already carries
+     * (container colr box / codec API signaling) into the format.
+     * Only set keys when avctx carries explicit values: UNSPECIFIED stays
+     * unspecified, so there is zero behavior change for legacy streams.
+     * Numeric values below are Android MediaFormat constants, mirroring the
+     * FFAMediaFormatColor* enums in mediacodec_wrapper.h (sourced from AOSP
+     * MediaFormat: COLOR_TRANSFER_SDR_VIDEO=3, COLOR_TRANSFER_ST2084=6,
+     * COLOR_TRANSFER_HLG=7, COLOR_STANDARD_BT709=1, COLOR_STANDARD_BT2020=6,
+     * COLOR_RANGE_FULL=1, COLOR_RANGE_LIMITED=2). */
+    if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+        int format_color_transfer = -1;
+        int format_color_standard = -1;
+        int format_color_range    = -1;
+
+        /* MediaCodec also never reads the HEVC bitstream VUI itself: when
+         * no container color metadata reached avctx (UNSPECIFIED above),
+         * recover the SPS VUI colour description straight from extradata
+         * so the keys below still get set for pure HDR HEVC streams.
+         * Values missing from the bitstream or invalid stay UNSPECIFIED. */
+        if (avctx->codec_id == AV_CODEC_ID_HEVC &&
+            avctx->extradata && avctx->extradata_size > 0 &&
+            avctx->color_trc == AVCOL_TRC_UNSPECIFIED &&
+            avctx->color_primaries == AVCOL_PRI_UNSPECIFIED) {
+            int vui_trc = -1, vui_prim = -1, vui_matrix = -1;
+
+            if (mcdec_probe_hevc_vui_color(avctx, &vui_trc, &vui_prim,
+                                           &vui_matrix) == 0) {
+                avctx->color_trc        = vui_trc;
+                avctx->color_primaries  = vui_prim;
+                avctx->colorspace       = vui_matrix;
+                av_log(avctx, AV_LOG_ERROR,
+                       "MKSVUIPROBE: trc=%d prim=%d matrix=%d\n",
+                       vui_trc, vui_prim, vui_matrix);
+            } else {
+                av_log(avctx, AV_LOG_DEBUG,
+                       "MKSVUIPROBE: no usable SPS VUI color descriptor\n");
+            }
+        }
+
+        av_log(avctx, AV_LOG_ERROR,
+               "MKSCOLORKEYS: avctx trc=%d prim=%d range=%d\n",
+               avctx->color_trc, avctx->color_primaries,
+               avctx->color_range);
+
+        switch (avctx->color_trc) {
+        case AVCOL_TRC_SMPTE2084:    /* 16 */
+            format_color_transfer = 6; /* COLOR_TRANSFER_ST2084 */
+            break;
+        case AVCOL_TRC_ARIB_STD_B67: /* 18, HLG */
+            format_color_transfer = 7; /* COLOR_TRANSFER_HLG */
+            break;
+        /* Known SDR transfers map to COLOR_TRANSFER_SDR_VIDEO. */
+        case AVCOL_TRC_BT709:     /* 1 */
+        case AVCOL_TRC_GAMMA22:   /* 4 */
+        case AVCOL_TRC_GAMMA28:   /* 5 */
+        case AVCOL_TRC_SMPTE170M: /* 6, BT601 */
+        case AVCOL_TRC_SMPTE240M: /* 7 */
+        case AVCOL_TRC_BT2020_10: /* 14 */
+        case AVCOL_TRC_BT2020_12: /* 15 */
+            format_color_transfer = 3; /* COLOR_TRANSFER_SDR_VIDEO */
+            break;
+        default: /* conservative: leave the key unset */
+            break;
+        }
+
+        switch (avctx->color_primaries) {
+        case AVCOL_PRI_BT2020: /* 9 */
+            format_color_standard = 6; /* COLOR_STANDARD_BT2020 */
+            break;
+        case AVCOL_PRI_BT709:  /* 1 */
+            format_color_standard = 1; /* COLOR_STANDARD_BT709 */
+            break;
+        default: /* conservative: leave the key unset */
+            break;
+        }
+
+        switch (avctx->color_range) {
+        case AVCOL_RANGE_JPEG: /* 2, full range */
+            format_color_range = 1; /* COLOR_RANGE_FULL */
+            break;
+        case AVCOL_RANGE_MPEG: /* 1, limited range */
+            format_color_range = 2; /* COLOR_RANGE_LIMITED */
+            break;
+        default: /* AVCOL_RANGE_UNSPECIFIED: leave the key unset */
+            break;
+        }
+
+        if (format_color_transfer >= 0)
+            ff_AMediaFormat_setInt32(format, "color-transfer", format_color_transfer);
+        if (format_color_standard >= 0)
+            ff_AMediaFormat_setInt32(format, "color-standard", format_color_standard);
+        if (format_color_range >= 0)
+            ff_AMediaFormat_setInt32(format, "color-range", format_color_range);
+    }
+
     status = ff_AMediaCodec_configure(s->codec, format, s->surface, NULL, 0);
     if (status < 0) {
         char *desc = ff_AMediaFormat_toString(format);
