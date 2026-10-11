@@ -1,0 +1,79 @@
+name: Routing current native source checks
+on:
+  push:
+    branches: [routing/MK-ROUTING-20261011]
+  pull_request:
+    branches: [lg-p84-d1-vui-fix-20261010]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-routing-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+jobs:
+  selection:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: ffmpeg
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: Goodwu/media-kit
+          ref: routing/MK-ROUTING-20261011
+          path: media-kit
+          persist-credentials: false
+      - name: Record exact current input vector
+        run: |
+          set -euo pipefail
+          mkdir results
+          test "$(git -C ffmpeg rev-parse HEAD)" = '${{ github.event.pull_request.head.sha || github.sha }}'
+          printf 'ffmpeg=%s\nmediaKit=%s\n' "$(git -C ffmpeg rev-parse HEAD)" "$(git -C media-kit rev-parse HEAD)" > results/heads.txt
+      - name: Validate extractor and run production C with host JNI fixtures
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s media-kit/tool/routing_native_audit -p test_extract.py -v 2>&1 | tee results/extractor.log
+          python3 media-kit/tool/routing_native_audit/run.py --ffmpeg-root ffmpeg --output results/clang --cc clang --sanitize
+          python3 media-kit/tool/routing_native_audit/run.py --ffmpeg-root ffmpeg --output results/gcc --cc gcc --sanitize
+          git -C ffmpeg diff --exit-code
+          git -C media-kit diff --exit-code
+          test "$(git -C media-kit rev-parse HEAD)" = "$(git -C media-kit ls-remote origin refs/heads/routing/MK-ROUTING-20261011 | cut -f1)"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: routing-native-selection-${{ github.event.pull_request.head.sha || github.sha }}
+          path: results
+          if-no-files-found: error
+  android-compile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [24, 35]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Compile actual current FFmpeg MediaCodec code for Android
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = '${{ github.event.pull_request.head.sha || github.sha }}'
+          bash tools/media-kit-android-compile.sh "$RUNNER_TEMP/native-compile-${{ matrix.api }}" '${{ matrix.api }}'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: routing-android-api${{ matrix.api }}-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            ${{ runner.temp }}/native-compile-${{ matrix.api }}/*.txt
+            ${{ runner.temp }}/native-compile-${{ matrix.api }}/*.log
+            ${{ runner.temp }}/native-compile-${{ matrix.api }}/*.h
+            ${{ runner.temp }}/native-compile-${{ matrix.api }}/*.mak
+            ${{ runner.temp }}/native-compile-${{ matrix.api }}/*.sha256
+            ${{ runner.temp }}/native-compile-${{ matrix.api }}/build/ffbuild/config.log
+          if-no-files-found: error
