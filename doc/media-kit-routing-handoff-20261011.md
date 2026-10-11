@@ -15,3 +15,7 @@ Reuse media-kit tool/routing_native_audit, extend its controls rather than makin
 ## State at registration
 
 Branch created and pushed; production repair pending. Local user's preexisting FFmpeg configure worktree modification must not be reset, overwritten or silently included. This remote branch does not access or modify that worktree. Capture any additional applicable product build-tree patches explicitly before full candidate packaging.
+
+## Repair checkpoint
+
+Strict P5/P8 lookup and empty-DV-profile handling implemented in this source commit. Current-source host regression must pass before saving; Android compilation and independent rerun remain required. Do not recreate this repair in another branch.
