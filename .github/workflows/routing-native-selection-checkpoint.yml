@@ -1,0 +1,122 @@
+name: Routing native selection checkpoint
+on:
+  push:
+    branches: [routing/MK-ROUTING-20261011]
+    paths: ['.github/workflows/routing-native-selection-checkpoint.yml']
+permissions:
+  contents: write
+jobs:
+  repair:
+    if: github.repository == 'Goodwu/FFmpeg'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: routing/MK-ROUTING-20261011
+          path: ffmpeg
+      - uses: actions/checkout@v4
+        with:
+          repository: Goodwu/media-kit
+          ref: routing/MK-ROUTING-20261011
+          path: media-kit
+          persist-credentials: false
+      - name: Reproduce failure in the current native sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C ffmpeg rev-parse HEAD)" = "$GITHUB_SHA"
+          mkdir results
+          printf 'ffmpeg=%s\nmediaKit=%s\n' "$GITHUB_SHA" "$(git -C media-kit rev-parse HEAD)" > results/heads.txt
+          set +e
+          python3 media-kit/tool/routing_native_audit/run.py --ffmpeg-root ffmpeg --output results/before --cc clang --sanitize
+          code=$?
+          set -e
+          test "$code" = 1
+          python3 - <<'PY'
+          import json
+          r=json.load(open('results/before/receipt.json'))
+          assert r['compileExit']==0 and r['inputsUnchanged'] and r['regressionExit']==1
+          PY
+      - name: Apply only reviewed native profile constraints
+        working-directory: ffmpeg
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object libavcodec/mediacodecdec_common.c)" = 071eb9e9a98f0902b0ff886c8aaeabd3c6918a04
+          test "$(git hash-object libavcodec/mediacodec_wrapper.c)" = 96c886666ac5caeb074fc27de8030122cd92d5ce
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, '../media-kit/tool/routing_native_audit')
+          from run import block_end
+          p=Path('libavcodec/mediacodecdec_common.c'); s=p.read_text()
+          old='''        if (ff_AMediaFormat_getInt32(format, "profile", &format_profile) &&
+                      format_profile != 0x20 && format_profile != 0x2 &&
+                      format_profile != 0x100) {'''
+          # C indentation is eight spaces plus four continuation spaces.
+          old=old.replace('                      ', '            ')
+          new='''        if (!ff_AMediaFormat_getInt32(format, "profile", &format_profile) ||
+                      (format_profile != 0x20 && format_profile != 0x100)) {'''.replace('                      ', '            ')
+          assert s.count(old)==1
+          s=s.replace(old,new,1)
+          marker='        if (format_profile == 0x20) {'
+          assert s.count(marker)==1
+          start=s.index(marker); opening=s.index('{',start); first_end=block_end(s,opening)
+          else_start=s.index('else {',first_end); end=block_end(s,s.index('{',else_start))
+          s=s[:start]+'''        if (format_profile == 0x20) {
+                      /* P5: lookup and configure use DvheStn. */
+                      profile = format_profile;
+                      av_log(avctx, AV_LOG_INFO,
+                             "native_dv selecting Surface decoder: MIME=%s, profile=0x%x\\n", mime, profile);
+                  } else {
+                      /* P8: lookup and configure both require DvheSt. MIME-only
+                       * selection can pick a P5-only codec before a valid P8 codec.
+                       * Missing/legacy experimental signaling was rejected above. */
+                      profile = format_profile;
+                      av_log(avctx, AV_LOG_INFO,
+                             "native_dv selecting Surface decoder: MIME=%s, profile=0x%x\\n", mime, profile);
+                  }'''.replace('                  ', '        ').replace('                      ', '            ')+s[end:]
+          # Normalize the replacement independently of YAML block indentation.
+          replacement=s[start:s.index('\n    } else {',start)]
+          replacement=replacement.replace('\n    ', '\n    ')
+          p.write_text(s)
+          p=Path('libavcodec/mediacodec_wrapper.c'); s=p.read_text()
+          old='''            if (!profile_count) {
+                          found_codec = 1;
+                      }'''.replace('                          ', '                ').replace('                      ', '            ')
+          new='''            if (!profile_count) {
+                          /* Empty capability data is not evidence for a requested
+                           * native Dolby Vision profile. Preserve legacy behavior
+                           * for ordinary codecs and unconstrained MIME lookups. */
+                          found_codec = profile < 0 || av_strcasecmp(mime, "video/dolby-vision");
+                      }'''.replace('                          ', '                ').replace('                           ', '                 ').replace('                      ', '            ')
+          assert s.count(old)==1
+          p.write_text(s.replace(old,new,1))
+          p=Path('doc/media-kit-routing-handoff-20261011.md')
+          p.write_text(p.read_text()+'\n## Repair checkpoint\n\nStrict P5/P8 lookup and empty-DV-profile handling implemented in this source commit. Current-source host regression must pass before saving; Android compilation and independent rerun remain required. Do not recreate this repair in another branch.\n')
+          PY
+          git diff --check
+          git diff --binary > ../results/repair.patch
+      - name: Run current-source regression after repair
+        run: python3 media-kit/tool/routing_native_audit/run.py --ffmpeg-root ffmpeg --output results/after --cc clang --sanitize
+      - name: Save the source repair to the registered branch
+        working-directory: ffmpeg
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code -- .github configure
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add libavcodec/mediacodecdec_common.c libavcodec/mediacodec_wrapper.c doc/media-kit-routing-handoff-20261011.md
+          git commit -m 'avcodec/mediacodec: match native DV profile before selecting decoder [MK-ROUTING-20261011 B3]'
+          test "$(git ls-remote origin refs/heads/routing/MK-ROUTING-20261011 | cut -f1)" = "$GITHUB_SHA"
+          git push origin HEAD:refs/heads/routing/MK-ROUTING-20261011
+          git rev-parse HEAD > ../results/implemented-head.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: routing-native-repair-${{ github.sha }}
+          path: results
+          if-no-files-found: error
+          retention-days: 14
