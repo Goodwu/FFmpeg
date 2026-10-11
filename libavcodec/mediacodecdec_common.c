@@ -1060,30 +1060,24 @@ static int mediacodec_dec_get_video_codec(AVCodecContext *avctx, MediaCodecDecCo
             av_log(avctx, AV_LOG_ERROR, "native_dv requires an HEVC decoder\n");
             return AVERROR(EINVAL);
         }
-        if (ff_AMediaFormat_getInt32(format, "profile", &format_profile) &&
-            format_profile != 0x20 && format_profile != 0x2 &&
-            format_profile != 0x100) {
+        if (!ff_AMediaFormat_getInt32(format, "profile", &format_profile) ||
+            (format_profile != 0x20 && format_profile != 0x100)) {
             av_log(avctx, AV_LOG_ERROR, "native_dv received an unexpected Android profile 0x%x\n",
                    format_profile);
             return AVERROR_INVALIDDATA;
         }
         if (format_profile == 0x20) {
-            /* P5: explicit DolbyVisionProfileDvheStn, matching the declared
-             * decoder capability. */
+            /* P5: lookup and configure use DvheStn. */
             profile = format_profile;
             av_log(avctx, AV_LOG_INFO,
-                   "native_dv selecting Surface decoder: MIME=%s, profile=0x%x\n", mime, profile);
+         "native_dv selecting Surface decoder: MIME=%s, profile=0x%x\n", mime, profile);
         } else {
-            /* P8: configure with the modern-SDK DvheSt key (0x100). On the
-             * API 24 test device this is refused at configure (fail-fast);
-             * accepted signaling (0x20) stalls presentation instead. The
-             * lookup stays MIME-only (profile < 0) because declared
-             * capabilities omit P8 keys; 0x2 is retained in the whitelist
-             * only as the API 24-era experimental value. */
-            profile = -1;
+            /* P8: lookup and configure both require DvheSt. MIME-only
+             * selection can pick a P5-only codec before a valid P8 codec.
+             * Missing/legacy experimental signaling was rejected above. */
+            profile = format_profile;
             av_log(avctx, AV_LOG_INFO,
-                   "native_dv selecting Surface decoder: MIME=%s, configure profile=0x%x (MIME-only lookup)\n",
-                   mime, format_profile);
+         "native_dv selecting Surface decoder: MIME=%s, profile=0x%x\n", mime, profile);
         }
     } else {
         profile = ff_AMediaCodecProfile_getProfileFromAVCodecContext(avctx);

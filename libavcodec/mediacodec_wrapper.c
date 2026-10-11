@@ -593,7 +593,10 @@ char *ff_AMediaCodecList_getCodecNameByType(const char *mime, int profile, int e
 
             profile_count = (*env)->GetArrayLength(env, profile_levels);
             if (!profile_count) {
-                found_codec = 1;
+                /* Empty capability data is not evidence for a requested
+                 * native Dolby Vision profile. Preserve legacy behavior
+                 * for ordinary codecs and unconstrained MIME lookups. */
+                found_codec = profile < 0 || av_strcasecmp(mime, "video/dolby-vision");
             }
             for (k = 0; k < profile_count; k++) {
                 int supported_profile = 0;
